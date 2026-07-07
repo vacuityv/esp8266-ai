@@ -57,7 +57,7 @@ let server = HTTPServer(port: port, routes: [
     "/event": { body in
         if let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
            let agent = obj["agent"] as? String, let event = obj["event"] as? String {
-            service.recordEvent(agent: agent, event: event)
+            service.recordEvent(agent: agent, event: event, message: obj["message"] as? String)
             return Data("{\"ok\":true}".utf8)
         }
         return Data("{\"ok\":false}".utf8)

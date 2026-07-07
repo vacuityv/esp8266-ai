@@ -79,17 +79,34 @@ final class StatusService {
     private static let idleEvents: Set<String> = [
         "Stop", "SessionEnd", "SessionStart",
     ]
-    // Claude fires Notification when it needs approval / your input; Codex
-    // fires PermissionRequest. Elicitation covers MCP prompt dialogs.
+    // Codex PermissionRequest and MCP Elicitation are always a real "act now"
+    // prompt. Claude's Notification is broader — it also fires on task
+    // completion / 60s-idle — so it only counts as needs-input when its
+    // message is actually a permission request (see isPermissionNotification).
     private static let attentionEvents: Set<String> = [
-        "Notification", "Elicitation", "PermissionRequest",
+        "Elicitation", "PermissionRequest",
     ]
 
+    private func isPermissionNotification(_ message: String?) -> Bool {
+        guard let m = message?.lowercased() else { return false }
+        return m.contains("permission") || m.contains("approve") || m.contains("approval")
+    }
+
     /// Called by the /event endpoint. Unknown event names are ignored.
-    func recordEvent(agent: String, event: String) {
+    /// `message` is only sent for Claude's Notification hook.
+    func recordEvent(agent: String, event: String, message: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
+        // Claude Notification: flash only for permission prompts, not for
+        // "task done / waiting for your input" notifications.
+        if event == "Notification" {
+            if isPermissionNotification(message) {
+                if agent == "claude" { claudeNeedsInputAt = now }
+                else if agent == "codex" { codexNeedsInputAt = now }
+            }
+            return
+        }
         if Self.attentionEvents.contains(event) {
             if agent == "claude" { claudeNeedsInputAt = now }
             else if agent == "codex" { codexNeedsInputAt = now }
