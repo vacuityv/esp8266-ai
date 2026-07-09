@@ -1,0 +1,111 @@
+# AI-Clock 跨网中继 (relay)
+
+当**时钟**和**桥接端 Mac** 不在同一个局域网时(例如 Mac 在 `YUGUO-R.D`、时钟在
+`YUGUO-moblie`,两者不同网段),时钟无法直接访问 Mac 的本地 HTTP 服务。这个中继解决它:
+
+```
+Mac (任意网络)                     VPS (公网)                     时钟 (任意 2.4G 网络)
+  RelayPusher 每 1s              relay.py 内存里                  bridgeHost 指向 VPS
+  POST /ingest/<key>   ───►      只存"每个路由的最新一份"  ◄───   GET /r/<secret>/status ...
+  (Authorization: Bearer)                                        (拿到的字节 == Mac 本地服务返回的)
+```
+
+**关键点**:中继只是"原样搬运字节"。时钟拉到的 `/status`、`/net`、`/music`、
+`/music/cover.raw`、`/music/text.raw` 和原来 Mac 本地返回的完全一致,所以**固件一行都不用改**,
+只需把 `bridgeHost` 设成 VPS 地址(见下)。`/net` 的 `seq` 增量逻辑照常工作,因为 Mac 的 JSON 被逐字转发。
+
+> 范围:v1 只做**遥测**(Mac → 时钟 的显示数据)。菜单栏那些 **Mac → 设备**的控制
+> (切换显示模式 `/api/display`、上传宠物 GIF `/sprite`、读 `/api/info`)是 Mac 直连设备 IP 的,
+> 跨段后不可用;要保留需再加一层"命令通道"(设备轮询 VPS 取命令),尚未实现。
+
+## 文件
+
+| 文件 | 作用 |
+|---|---|
+| `relay.py` | 中继本体,Python 3 stdlib,零第三方依赖 |
+| `aiclock-relay.service` | systemd 单元,常驻 + 开机自启 |
+| `aiclock-relay.env.example` | 环境变量模板(真实密钥不进 repo) |
+
+## 一、部署到 VPS
+
+```bash
+# 1. 上传
+scp relay/relay.py            <vps>:/tmp/relay.py
+scp relay/aiclock-relay.service <vps>:/tmp/aiclock-relay.service
+ssh <vps> 'sudo mkdir -p /opt/aiclock-relay \
+  && sudo mv /tmp/relay.py /opt/aiclock-relay/relay.py \
+  && sudo mv /tmp/aiclock-relay.service /etc/systemd/system/aiclock-relay.service'
+
+# 2. 生成密钥并写 /etc/aiclock-relay.env(权限 600)
+ssh <vps> 'sudo bash -c "cat > /etc/aiclock-relay.env <<EOF
+RELAY_PORT=8080
+PUSH_TOKEN=$(openssl rand -hex 16)
+PULL_SECRET=$(openssl rand -hex 8)
+EOF
+chmod 600 /etc/aiclock-relay.env"'
+
+# 3. 启动
+ssh <vps> 'sudo systemctl daemon-reload && sudo systemctl enable --now aiclock-relay'
+```
+
+- `PUSH_TOKEN` — Mac 推送时的 Bearer token(私密)。
+- `PULL_SECRET` — 时钟拉取路径里的密钥,`/r/<PULL_SECRET>/...`(半公开:会出现在设备配置里)。
+
+**⚠️ 云防火墙**:必须在 **腾讯云/云厂商安全组** 放行 **TCP `RELAY_PORT`(默认 8080)**,
+来源 `0.0.0.0/0`(或收窄到时钟出口 IP)。VPS 上的 ufw 若启用也要一并放行。
+
+## 二、配置 Mac(桥接端)
+
+`RelayPusher` 是 opt-in 的。配置来源优先级:环境变量 > `~/.config/aiclock/relay.env`。
+因为 `.app` 用 `open` 启动**不继承 shell 环境变量**,推荐用配置文件:
+
+```bash
+mkdir -p ~/.config/aiclock
+cat > ~/.config/aiclock/relay.env <<EOF
+RELAY_BASE=http://<vps-ip>:8080
+RELAY_TOKEN=<PUSH_TOKEN 的值>
+EOF
+chmod 600 ~/.config/aiclock/relay.env
+```
+
+不配置这个文件(也不给 env)时,relay 功能休眠,app 行为和以前完全一样(只跑本地服务)。
+
+## 三、配置时钟
+
+配网门户里把 **Bridge 地址**填成(注意带上密钥路径):
+
+```
+<vps-ip>:8080/r/<PULL_SECRET>
+```
+
+固件是 `"http://" + bridgeHost + "/status"` 纯拼接,所以上面这串会被拼成
+`http://<vps-ip>:8080/r/<PULL_SECRET>/status`,正好命中中继的拉取路由。
+
+## 四、自测
+
+```bash
+# 健康页(无需密钥,只显示各路由的大小/新鲜度)
+curl http://<vps-ip>:8080/health
+
+# 冒充 Mac 推一条,再冒充时钟拉回来
+curl -X POST -H "Authorization: Bearer <PUSH_TOKEN>" --data '{"t":1}' \
+     http://<vps-ip>:8080/ingest/status
+curl http://<vps-ip>:8080/r/<PULL_SECRET>/status     # 应回 {"t":1}
+curl -o /dev/null -w '%{http_code}\n' http://<vps-ip>:8080/r/wrong/status   # 应 403
+```
+
+## 运维
+
+```bash
+systemctl status aiclock-relay
+journalctl -u aiclock-relay -f
+sudo systemctl restart aiclock-relay   # 改了 /etc/aiclock-relay.env 后
+```
+
+## 安全说明
+
+- 时钟只能走 **HTTP**(ESP8266 上 HTTPS 太重),所以拉取靠"密钥藏在路径里"的能力 URL 防路人,
+  不是强加密。想更严可把安全组来源收窄到时钟出口 IP。
+- 推送侧有 `PUSH_TOKEN` Bearer 校验,`/health` 不暴露任何 payload,只报大小和时间。
+- 密钥只存在于 VPS 的 `/etc/aiclock-relay.env`(600)和 Mac 的 `~/.config/aiclock/relay.env`(600),
+  **不进 git**。

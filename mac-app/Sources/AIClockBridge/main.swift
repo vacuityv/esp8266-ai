@@ -87,6 +87,16 @@ do {
     FileHandle.standardError.write(Data("[bridge] failed to bind port \(port): \(error)\n".utf8))
 }
 
+// Cross-LAN relay (opt-in via RELAY_BASE / RELAY_TOKEN): when the clock can't
+// reach us directly, mirror the same route bytes up to a public relay it polls.
+let relay = RelayPusher(
+    statusJSON: { service.snapshot().jsonData() },
+    netJSON: { netMonitor.jsonData() },
+    musicJSON: { nowPlaying.jsonData() },
+    coverRaw: { nowPlaying.coverRGB565 },
+    textRaw: { nowPlaying.textRGB565 })
+relay?.start()
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,

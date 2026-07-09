@@ -1,0 +1,20 @@
+[Unit]
+Description=AI-Clock relay (Mac <-> ESP8266 clock across different LANs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/aiclock-relay.env
+ExecStart=/usr/bin/python3 /opt/aiclock-relay/relay.py
+Restart=always
+RestartSec=2
+# Hardening: the relay needs no privileges and touches nothing on disk.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
