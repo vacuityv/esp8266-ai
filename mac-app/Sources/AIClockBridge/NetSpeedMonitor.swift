@@ -92,15 +92,22 @@ final class NetSpeedMonitor {
         guard let lr = lastRx, let lt = lastTx, let la = lastAt else { return }
         let dt = now.timeIntervalSince(la)
         guard dt > 0.2 else { return }
-        // counters are 32-bit in if_data and wrap; treat negatives as a wrap
-        let dRx = rx >= lr ? rx - lr : rx &+ (UInt64(UInt32.max) - lr)
-        let dTx = tx >= lt ? tx - lt : tx &+ (UInt64(UInt32.max) - lt)
+        // The totals combine multiple interfaces, so they can decrease when an
+        // interface disappears or its kernel counter resets. Rebaseline rather
+        // than interpreting that change as a single 32-bit counter wrap.
+        guard let dRx = Self.counterDelta(current: rx, previous: lr),
+              let dTx = Self.counterDelta(current: tx, previous: lt) else { return }
         let sample = Sample(rx: Double(dRx) / dt, tx: Double(dTx) / dt)
         lock.lock()
         samples.append(sample)
         totalSamples += 1
         if samples.count > capacity { samples.removeFirst(samples.count - capacity) }
         lock.unlock()
+    }
+
+    static func counterDelta(current: UInt64, previous: UInt64) -> UInt64? {
+        guard current >= previous else { return nil }
+        return current - previous
     }
 
     private static func counters() -> (UInt64, UInt64) {
