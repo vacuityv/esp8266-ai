@@ -62,11 +62,12 @@ final class RelayPusher {
 
     func start() {
         FileHandle.standardError.write(Data("[relay] pushing to \(base.absoluteString)/ingest/*\n".utf8))
-        // 1 Hz on the background queue: /net's tail carries 12 samples (3s @
-        // 4Hz), so a clock polling every 2s never misses a sample even with
-        // relay/network jitter.
+        // Every 5s on the background queue, matching the clock's poll cadence to
+        // keep relay traffic low. /net's tail carries 28 samples (7s @ 4Hz) — a
+        // bit more than one 5s push — so no samples are lost between pushes and
+        // the clock's draw queue never starves.
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now(), repeating: 1.0)
+        t.schedule(deadline: .now(), repeating: 5.0)
         t.setEventHandler { [weak self] in self?.tick() }
         timer = t
         t.resume()

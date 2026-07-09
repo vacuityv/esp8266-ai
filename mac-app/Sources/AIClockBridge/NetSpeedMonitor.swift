@@ -61,7 +61,9 @@ final class NetSpeedMonitor {
     func jsonData() -> Data {
         lock.lock()
         let seq = totalSamples
-        let tail = Array(samples.suffix(12))
+        // 28 samples (7s @ 4Hz) so a consumer polling/pushing on a ~5s cadence
+        // never drops samples between fetches and keeps the sweep queue fed.
+        let tail = Array(samples.suffix(28))
         lock.unlock()
         let smoothed = currentSmoothed
         let dict: [String: Any] = [
