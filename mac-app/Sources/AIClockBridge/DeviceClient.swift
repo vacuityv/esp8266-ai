@@ -40,8 +40,13 @@ final class DeviceClient {
         return URL(string: h.hasPrefix("http") ? h : "http://\(h)")
     }
 
-    /// GET /api/info
+    /// GET /api/info (direct), or the relay's /control/deviceinfo when the
+    /// device is on another LAN (see `relayControl`).
     static func fetchInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        if let relay = relayControl {
+            fetchInfoViaRelay(relay, completion: completion)
+            return
+        }
         guard let base = baseURL else {
             completion(.failure(Self.noHostError))
             return
@@ -52,25 +57,7 @@ final class DeviceClient {
             var result: Result<DeviceInfo, Error>
             if let error = error {
                 result = .failure(error)
-            } else if let data = data,
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                var info = DeviceInfo()
-                info.ip = obj["ip"] as? String ?? ""
-                info.ssid = obj["ssid"] as? String ?? ""
-                info.bridge = obj["bridge"] as? String ?? ""
-                info.mode = obj["mode"] as? String ?? "auto"
-                info.effective = obj["effective"] as? String ?? info.mode
-                info.showing = obj["showing"] as? String ?? ""
-                info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
-                info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
-                let claude = obj["claude"] as? [String: Any]
-                let codex = obj["codex"] as? [String: Any]
-                info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
-                info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
-                info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
-                info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
-                info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
-                info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+            } else if let data = data, let info = parseDeviceInfo(data) {
                 result = .success(info)
             } else {
                 result = .failure(Self.badResponseError)
@@ -79,19 +66,55 @@ final class DeviceClient {
         }.resume()
     }
 
+    /// Maps an /api/info JSON body to DeviceInfo. Shared by the direct and the
+    /// relay paths (the device reports the exact same JSON to the relay).
+    static func parseDeviceInfo(_ data: Data) -> DeviceInfo? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        var info = DeviceInfo()
+        info.ip = obj["ip"] as? String ?? ""
+        info.ssid = obj["ssid"] as? String ?? ""
+        info.bridge = obj["bridge"] as? String ?? ""
+        info.mode = obj["mode"] as? String ?? "auto"
+        info.effective = obj["effective"] as? String ?? info.mode
+        info.showing = obj["showing"] as? String ?? ""
+        info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
+        info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
+        let claude = obj["claude"] as? [String: Any]
+        let codex = obj["codex"] as? [String: Any]
+        info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
+        info.codexCustomSprite = codex?["custom_sprite"] as? Bool ?? false
+        info.claudeW = (claude?["w"] as? NSNumber)?.intValue ?? 111
+        info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
+        info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
+        info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+        return info
+    }
+
     /// POST /api/display  mode=auto|claude|codex|net|music
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
+        if let relay = relayControl {
+            sendCommand(relay, ["type": "display", "mode": mode], completion: completion)
+            return
+        }
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
 
     /// POST /api/bridge  host=ip:port
     static func setBridgeHost(_ bridgeHost: String, completion: @escaping (Error?) -> Void) {
+        if let relay = relayControl {
+            sendCommand(relay, ["type": "bridge", "host": bridgeHost], completion: completion)
+            return
+        }
         postForm(path: "api/bridge", fields: ["host": bridgeHost], completion: completion)
     }
 
     /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
     /// and rescales the GIF on-board, then swaps the animation immediately.
     static func uploadGif(_ gif: Data, slot: String, completion: @escaping (Error?) -> Void) {
+        if let relay = relayControl {
+            uploadGifViaRelay(relay, gif, slot: slot, completion: completion)
+            return
+        }
         guard let base = baseURL else {
             completion(Self.noHostError)
             return
@@ -113,6 +136,10 @@ final class DeviceClient {
 
     /// POST /sprite/{claude|codex}/reset — back to the compiled-in animation.
     static func resetSprite(slot: String, completion: @escaping (Error?) -> Void) {
+        if let relay = relayControl {
+            sendCommand(relay, ["type": "reset", "slot": slot], completion: completion)
+            return
+        }
         postForm(path: "sprite/\(slot)/reset", fields: [:], completion: completion)
     }
 
@@ -136,6 +163,80 @@ final class DeviceClient {
             }
             DispatchQueue.main.async { completion(result) }
         }.resume()
+    }
+
+    // MARK: - relay control routing
+
+    /// When the relay is configured the device is (typically) on another LAN and
+    /// unreachable directly, so control goes through the relay: the device
+    /// reports its info there and polls it for commands. nil => direct mode.
+    private static var relayControl: (base: URL, token: String)? {
+        guard let baseStr = AppConfig.string("RELAY_BASE"),
+              let token = AppConfig.string("RELAY_TOKEN"),
+              let url = URL(string: baseStr.hasPrefix("http") ? baseStr : "http://\(baseStr)") else {
+            return nil
+        }
+        return (url, token)
+    }
+
+    /// Device stale after this long without reporting to the relay => "offline".
+    private static let relayInfoStaleSeconds = 30
+
+    private static func fetchInfoViaRelay(_ relay: (base: URL, token: String),
+                                          completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
+        var req = URLRequest(url: relay.base.appendingPathComponent("control/deviceinfo"))
+        req.timeoutInterval = 8
+        req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { data, resp, error in
+            var result: Result<DeviceInfo, Error>
+            let http = resp as? HTTPURLResponse
+            if let error = error {
+                result = .failure(error)
+            } else if http?.statusCode == 200, let data = data, let info = parseDeviceInfo(data) {
+                // The device reports periodically; if we haven't heard from it
+                // in a while treat it as offline rather than showing stale data.
+                let age = Int(http?.value(forHTTPHeaderField: "X-Relay-Age") ?? "") ?? 0
+                if age > relayInfoStaleSeconds {
+                    result = .failure(NSError(domain: "DeviceClient", code: 3,
+                        userInfo: [NSLocalizedDescriptionKey: "设备 \(age)s 未上报（可能离线）"]))
+                } else {
+                    result = .success(info)
+                }
+            } else {
+                // 404 => the device has never reported (never connected via relay).
+                result = .failure(Self.badResponseError)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }.resume()
+    }
+
+    /// POST a control command to the relay's queue; the device drains it on its
+    /// next poll and applies it locally.
+    private static func sendCommand(_ relay: (base: URL, token: String), _ cmd: [String: Any],
+                                    completion: @escaping (Error?) -> Void) {
+        var req = URLRequest(url: relay.base.appendingPathComponent("control/command"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8
+        req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: cmd)
+        run(req, completion: completion)
+    }
+
+    /// Upload the GIF blob to the relay, then queue a "sprite" command telling
+    /// the device to fetch and decode it for the given slot.
+    private static func uploadGifViaRelay(_ relay: (base: URL, token: String), _ gif: Data,
+                                          slot: String, completion: @escaping (Error?) -> Void) {
+        var req = URLRequest(url: relay.base.appendingPathComponent("control/gif/\(slot)"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        req.httpBody = gif
+        run(req) { error in
+            if let error = error { completion(error); return }
+            sendCommand(relay, ["type": "sprite", "slot": slot], completion: completion)
+        }
     }
 
     // MARK: - internals

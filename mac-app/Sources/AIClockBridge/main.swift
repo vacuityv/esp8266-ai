@@ -33,6 +33,27 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
     exit(0)
 }
 
+// Headless smoke test for the v2 relay control channel: enqueues a display
+// command and reads device info back, all via the relay (needs RELAY_BASE /
+// RELAY_TOKEN configured). AIClockBridge --test-control [mode]
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--test-control" {
+    let mode = CommandLine.arguments.count >= 3 ? CommandLine.arguments[2] : "net"
+    print("relay control smoke test -> setDisplayMode(\(mode)) then fetchInfo")
+    DeviceClient.setDisplayMode(mode) { err in
+        print("setDisplayMode:", err.map { "FAILED \($0.localizedDescription)" } ?? "ok")
+        DeviceClient.fetchInfo { result in
+            switch result {
+            case let .success(info):
+                print("fetchInfo ok: ip=\(info.ip) mode=\(info.mode) showing=\(info.showing) bridge=\(info.bridge)")
+            case let .failure(e):
+                print("fetchInfo failed:", e.localizedDescription)
+            }
+            exit(0)
+        }
+    }
+    RunLoop.main.run()
+}
+
 let port: UInt16 = 8765
 let service = StatusService()
 let usage = UsageFetcher()
