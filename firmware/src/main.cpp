@@ -1013,7 +1013,9 @@ const char *displayModeName(DisplayMode m) {
   return "auto";
 }
 
-void handleApiInfo() {
+// Same JSON the /api/info route returns. Shared so the relay reporter can push
+// the identical payload up (the Mac parses it the same either way).
+String buildDeviceInfoJson() {
   JsonDocument doc;
   doc["ip"] = WiFi.localIP().toString();
   doc["ssid"] = WiFi.SSID();
@@ -1037,21 +1039,23 @@ void handleApiInfo() {
   x["h"] = CODEX_SPRITE_H;
   String out;
   serializeJson(doc, out);
-  webServer.send(200, "application/json", out);
+  return out;
 }
 
-void handleApiDisplay() {
-  String mode = webServer.arg("mode");
+void handleApiInfo() {
+  webServer.send(200, "application/json", buildDeviceInfoJson());
+}
+
+// Applies a display mode by name and repaints. Returns false on an unknown
+// mode. Shared by the /api/display route and the relay command channel.
+bool applyDisplayMode(const String &mode) {
   if (mode == "auto") displayMode = MODE_AUTO;
   else if (mode == "claude") displayMode = MODE_CLAUDE;
   else if (mode == "codex") displayMode = MODE_CODEX;
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
-  else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music");
-    return;
-  }
-  Serial.printf("[api] display mode = %s\n", mode.c_str());
+  else return false;
+  Serial.printf("[display] mode = %s\n", mode.c_str());
   if (displayMode == MODE_NET) {
     netChromeDrawn = false;
     lastNetPollMs = 0; // poll + draw on the next loop tick
@@ -1062,7 +1066,15 @@ void handleApiDisplay() {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
   }
-  webServer.send(200, "text/plain", "ok");
+  return true;
+}
+
+void handleApiDisplay() {
+  if (applyDisplayMode(webServer.arg("mode"))) {
+    webServer.send(200, "text/plain", "ok");
+  } else {
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music");
+  }
 }
 
 void handleApiBridge() {
@@ -1109,7 +1121,8 @@ void handleSpriteRaw(ActiveApp slot) {
 }
 
 // Removes a custom sprite so the compiled-in default animation comes back.
-void handleSpriteReset(ActiveApp slot) {
+// Shared by the /sprite/*/reset route and the relay command channel.
+void resetSpriteSlot(ActiveApp slot) {
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
   LittleFS.remove(binPath);
   spriteRev++;
@@ -1117,6 +1130,10 @@ void handleSpriteReset(ActiveApp slot) {
   if (slot == APP_CLAUDE) claudeFrame = 0;
   else codexFrame = 0;
   if (currentApp == slot) drawActiveApp();
+}
+
+void handleSpriteReset(ActiveApp slot) {
+  resetSpriteSlot(slot);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -1330,7 +1347,10 @@ void handleSpriteUploadChunk(const char *gifPath) {
   }
 }
 
-void handleSpriteUploadDone(ActiveApp slot) {
+// Decodes the raw gif already written to the slot's gif file into the on-screen
+// sprite and swaps it in. Shared by the multipart upload route and the relay
+// command channel (both write the gif file first, then call this). Returns ok.
+bool applyDecodedGif(ActiveApp slot) {
   const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
   const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
   int tw = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
@@ -1344,13 +1364,93 @@ void handleSpriteUploadDone(ActiveApp slot) {
   if (slot == APP_CLAUDE) claudeFrame = 0;
   else codexFrame = 0;
   if (currentApp == slot) drawActiveApp();
+  Serial.println(ok ? "[sprite] gif decoded & applied" : "[sprite] gif decode FAILED");
+  return ok;
+}
 
-  if (ok) {
+void handleSpriteUploadDone(ActiveApp slot) {
+  if (applyDecodedGif(slot)) {
     webServer.send(200, "text/plain", "ok");
-    Serial.println("[sprite] gif decoded & applied");
   } else {
     webServer.send(500, "text/plain", "gif decode failed (too large or unsupported?)");
-    Serial.println("[sprite] gif decode FAILED");
+  }
+}
+
+// ---------- relay control channel (v2) ----------
+// When the clock and the Mac are on different LANs the Mac can't reach us
+// directly, so control flows through the relay: we report /api/info to it and
+// poll it for queued commands. All requests just append paths to bridgeHost
+// (which already carries the /r/<secret> capability prefix), exactly like the
+// telemetry polls. NOTE: written but not yet verified on hardware.
+const unsigned long INFO_REPORT_INTERVAL_MS = 10000; // push our state to the relay
+const unsigned long CMD_POLL_INTERVAL_MS = 3000;     // pull queued commands
+unsigned long lastInfoReportMs = 0;
+unsigned long lastCmdPollMs = 0;
+
+// POST our /api/info JSON to the relay so the Mac can read it cross-LAN.
+void reportDeviceInfo() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/deviceinfo";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.POST(buildDeviceInfoJson());
+  http.end();
+}
+
+// Fetch the gif the Mac uploaded to the relay for `slot`, write it to the slot's
+// gif file, then decode+apply it (same final path as a multipart upload).
+bool applySpriteFromRelay(ActiveApp slot) {
+  const char *gifPath = (slot == APP_CLAUDE) ? CLAUDE_GIF_FILE : CODEX_GIF_FILE;
+  const char *slotName = (slot == APP_CLAUDE) ? "claude" : "codex";
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/gif/" + slotName;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+  File f = LittleFS.open(gifPath, "w");
+  if (!f) { http.end(); return false; }
+  http.writeToStream(&f);
+  f.close();
+  http.end();
+  return applyDecodedGif(slot);
+}
+
+// Pull queued commands from the relay and apply each locally. The relay returns
+// a JSON array and clears the queue on read.
+void pollCommands() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/commands";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return; }
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return; // parse error -> ignore
+  for (JsonObject cmd : doc.as<JsonArray>()) {
+    const char *type = cmd["type"] | "";
+    if (strcmp(type, "display") == 0) {
+      String mode = cmd["mode"] | "auto";
+      applyDisplayMode(mode);
+    } else if (strcmp(type, "reset") == 0) {
+      const char *slot = cmd["slot"] | "";
+      resetSpriteSlot(strcmp(slot, "codex") == 0 ? APP_CODEX : APP_CLAUDE);
+    } else if (strcmp(type, "sprite") == 0) {
+      const char *slot = cmd["slot"] | "";
+      applySpriteFromRelay(strcmp(slot, "codex") == 0 ? APP_CODEX : APP_CLAUDE);
+    } else if (strcmp(type, "bridge") == 0) {
+      const char *host = cmd["host"] | "";
+      if (strlen(host) > 0) { bridgeHost = host; saveBridgeHost(bridgeHost); }
+    }
   }
 }
 
@@ -1482,5 +1582,15 @@ void loop() {
   if (nowMs - lastPollMs >= BRIDGE_POLL_INTERVAL_MS) {
     lastPollMs = nowMs;
     pollBridge();
+  }
+
+  // Relay control channel (v2): report our state + pull queued commands.
+  if (nowMs - lastInfoReportMs >= INFO_REPORT_INTERVAL_MS) {
+    lastInfoReportMs = nowMs;
+    reportDeviceInfo();
+  }
+  if (nowMs - lastCmdPollMs >= CMD_POLL_INTERVAL_MS) {
+    lastCmdPollMs = nowMs;
+    pollCommands();
   }
 }
