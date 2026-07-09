@@ -14,9 +14,23 @@ Mac (任意网络)                     VPS (公网)                     时钟 (
 `/music/cover.raw`、`/music/text.raw` 和原来 Mac 本地返回的完全一致,所以**固件一行都不用改**,
 只需把 `bridgeHost` 设成 VPS 地址(见下)。`/net` 的 `seq` 增量逻辑照常工作,因为 Mac 的 JSON 被逐字转发。
 
-> 范围:v1 只做**遥测**(Mac → 时钟 的显示数据)。菜单栏那些 **Mac → 设备**的控制
-> (切换显示模式 `/api/display`、上传宠物 GIF `/sprite`、读 `/api/info`)是 Mac 直连设备 IP 的,
-> 跨段后不可用;要保留需再加一层"命令通道"(设备轮询 VPS 取命令),尚未实现。
+## v2:反向控制通道
+
+除了遥测,同一个中继还承载**反向的控制/查询**(让菜单栏跨段也能看设备信息、切显示模式、传 GIF):
+
+```
+读设备信息:  时钟 ─POST /r/<secret>/deviceinfo─► VPS ◄─GET /control/deviceinfo─ Mac(Bearer)
+下发命令:    Mac ─POST /control/command(Bearer)─► VPS ◄─GET /r/<secret>/commands─ 时钟(取即清空)
+传 GIF:      Mac ─POST /control/gif/<slot>(Bearer)► VPS ◄─GET /r/<secret>/gif/<slot>─ 时钟
+```
+
+- 时钟侧全部走 `/r/<secret>/...` 能力路径(固件只是往 `bridgeHost` 后拼路径),Mac 侧用 `Bearer <PUSH_TOKEN>`。
+- 命令 JSON:`{"type":"display","mode":"claude"}`、`{"type":"reset","slot":"claude"}`、
+  `{"type":"sprite","slot":"claude"}`(配合先传 GIF)、`{"type":"bridge","host":"..."}`。
+- Mac 端:配了中继时 `DeviceClient` 的 `fetchInfo`/切模式/传 GIF 自动改走这些接口(见 `RelayPusher` 同款配置)。
+- 固件端:每 10s 上报 `deviceinfo`、每 3s 轮询 `commands` 并本地执行。
+
+> ⚠️ **固件的反向通道尚未在硬件上验证**(写好、审查过,但开发机无 ESP8266 工具链)。中继 + Mac 两端已用 curl 模拟设备实测通过。
 
 ## 文件
 
