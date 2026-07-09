@@ -43,6 +43,13 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>  <string>12.0</string>
     <key>LSUIElement</key>             <true/>
     <key>NSHighResolutionCapable</key> <true/>
+    <!-- This tool talks to the ESP8266 clock and the self-hosted relay over
+         plaintext HTTP (the device can't do HTTPS), so App Transport Security
+         must allow arbitrary (non-TLS) loads or every request is blocked. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key> <true/>
+    </dict>
 </dict>
 </plist>
 PLIST
