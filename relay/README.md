@@ -64,11 +64,30 @@ mkdir -p ~/.config/aiclock
 cat > ~/.config/aiclock/relay.env <<EOF
 RELAY_BASE=http://<vps-ip>:8080
 RELAY_TOKEN=<PUSH_TOKEN 的值>
+# 可选:纯中继场景关掉本地 :8765 服务(见下)
+# LOCAL_HTTP=off
 EOF
 chmod 600 ~/.config/aiclock/relay.env
 ```
 
 不配置这个文件(也不给 env)时,relay 功能休眠,app 行为和以前完全一样(只跑本地服务)。
+
+### 可选:`LOCAL_HTTP` —— 关掉本地 :8765 服务
+
+app 默认在 `0.0.0.0:8765` 开本地 HTTP 服务,供**同网时钟**轮询。走中继(时钟和 Mac 不同网)
+时这个本地服务用不上,可以关掉:在上面的配置文件里(或用环境变量)加
+
+```
+LOCAL_HTTP=off      # on/1/true 开(默认);off/0/false 关
+```
+
+**⚠️ 注意**:`:8765` 上同时挂着 `POST /event`,是 Claude Code / Codex 的 **hook 实时事件**入口
+(hook 往 `127.0.0.1:8765/event` 推)。`LOCAL_HTTP=off` 会**一并关掉这个 hook 入口**。
+
+- 不用 hook 实时事件(只靠日志扫描 + 配额)→ 可放心关,少开一个 LAN 端口。
+- 在用 hook → 保持默认开(`LOCAL_HTTP` 不设或设 on)。
+
+关闭后 app 只做一件事:把数据推到中继。
 
 ## 三、配置时钟
 

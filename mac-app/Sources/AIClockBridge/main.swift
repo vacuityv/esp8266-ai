@@ -73,18 +73,25 @@ server.onRequest = { path, ip in
     DeviceClient.lastSeenIP = ip
     if DeviceClient.host.isEmpty { DeviceClient.host = ip }
 }
-// Active fallback for when the passive route can't fire at all (fresh /
-// erased device knows no bridge host, so it never polls anyone): if the
-// device stays silent, find it ourselves and hand it our address.
-Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
-    DeviceClient.healPairingIfNeeded(port: port)
-}
-
-do {
-    try server.start()
-    FileHandle.standardError.write(Data("[bridge] serving /status on 0.0.0.0:\(port)\n".utf8))
-} catch {
-    FileHandle.standardError.write(Data("[bridge] failed to bind port \(port): \(error)\n".utf8))
+// The local :8765 server serves the LAN clock's polls AND receives the
+// Claude/Codex hook events on POST /event. In a pure cross-LAN relay setup the
+// clock can't reach it, so it can be turned off (LOCAL_HTTP=off) — but note
+// that also disables the hook /event endpoint. Default on (unchanged behaviour).
+if AppConfig.bool("LOCAL_HTTP", default: true) {
+    // Active fallback for when the passive route can't fire at all (fresh /
+    // erased device knows no bridge host, so it never polls anyone): if the
+    // device stays silent, find it ourselves and hand it our address.
+    Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+        DeviceClient.healPairingIfNeeded(port: port)
+    }
+    do {
+        try server.start()
+        FileHandle.standardError.write(Data("[bridge] serving /status on 0.0.0.0:\(port)\n".utf8))
+    } catch {
+        FileHandle.standardError.write(Data("[bridge] failed to bind port \(port): \(error)\n".utf8))
+    }
+} else {
+    FileHandle.standardError.write(Data("[bridge] LOCAL_HTTP=off — local :\(port) server + hook /event disabled (relay-only)\n".utf8))
 }
 
 // Cross-LAN relay (opt-in via RELAY_BASE / RELAY_TOKEN): when the clock can't

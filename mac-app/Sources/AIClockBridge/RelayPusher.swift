@@ -37,9 +37,8 @@ final class RelayPusher {
     init?(statusJSON: @escaping () -> Data, netJSON: @escaping () -> Data,
           musicJSON: @escaping () -> Data, coverRaw: @escaping () -> Data,
           textRaw: @escaping () -> Data) {
-        let cfg = Self.resolveConfig()
-        guard let baseStr = cfg["RELAY_BASE"]?.trimmingCharacters(in: .whitespaces), !baseStr.isEmpty,
-              let token = cfg["RELAY_TOKEN"], !token.isEmpty,
+        guard let baseStr = AppConfig.string("RELAY_BASE"),
+              let token = AppConfig.string("RELAY_TOKEN"),
               let url = URL(string: baseStr.hasPrefix("http") ? baseStr : "http://\(baseStr)") else {
             return nil
         }
@@ -54,27 +53,6 @@ final class RelayPusher {
         sessionCfg.timeoutIntervalForRequest = 5
         sessionCfg.httpMaximumConnectionsPerHost = 2
         self.session = URLSession(configuration: sessionCfg)
-    }
-
-    /// env overrides file. File is `~/.config/aiclock/relay.env`, KEY=VALUE per
-    /// line, '#' comments and blank lines ignored.
-    private static func resolveConfig() -> [String: String] {
-        var cfg: [String: String] = [:]
-        let path = ("~/.config/aiclock/relay.env" as NSString).expandingTildeInPath
-        if let text = try? String(contentsOfFile: path, encoding: .utf8) {
-            for raw in text.split(whereSeparator: \.isNewline) {
-                let line = raw.trimmingCharacters(in: .whitespaces)
-                guard !line.isEmpty, !line.hasPrefix("#"),
-                      let eq = line.firstIndex(of: "=") else { continue }
-                let key = String(line[..<eq]).trimmingCharacters(in: .whitespaces)
-                let val = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-                cfg[key] = val
-            }
-        }
-        let env = ProcessInfo.processInfo.environment
-        if let v = env["RELAY_BASE"] { cfg["RELAY_BASE"] = v }
-        if let v = env["RELAY_TOKEN"] { cfg["RELAY_TOKEN"] = v }
-        return cfg
     }
 
     func start() {
