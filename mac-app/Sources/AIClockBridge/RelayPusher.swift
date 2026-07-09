@@ -25,7 +25,12 @@ final class RelayPusher {
     private let textRaw: () -> Data
 
     private let session: URLSession
-    private var timer: Timer?
+    // Everything runs on this background queue, never the main thread: gathering
+    // a snapshot rescans the CLI session logs, which would jank the menu bar if
+    // done on main. The data producers are all lock-guarded (and already called
+    // off-main by the local HTTP server), so this is safe.
+    private let queue = DispatchQueue(label: "aiclock.relay", qos: .utility)
+    private var timer: DispatchSourceTimer?
     // Binary blobs (cover art / rendered text) rarely change — only push on
     // change so we don't re-upload the same few KB every tick.
     private var lastCoverHash = 0
@@ -57,12 +62,14 @@ final class RelayPusher {
 
     func start() {
         FileHandle.standardError.write(Data("[relay] pushing to \(base.absoluteString)/ingest/*\n".utf8))
-        tick()
-        // 1 Hz: /net's tail carries 12 samples (3s @ 4Hz), so a clock polling
-        // every 2s never misses a sample even with relay/network jitter.
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
+        // 1 Hz on the background queue: /net's tail carries 12 samples (3s @
+        // 4Hz), so a clock polling every 2s never misses a sample even with
+        // relay/network jitter.
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now(), repeating: 1.0)
+        t.setEventHandler { [weak self] in self?.tick() }
+        timer = t
+        t.resume()
     }
 
     private func tick() {
