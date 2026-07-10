@@ -141,7 +141,9 @@ struct ClaudeStatus {
   int sessionMin = 0;
   int sessionWindowMin = 300;
   float fiveHourPct = -1; // real OAuth quota from the bridge, -1 = unknown
+  int fiveHourResetMin = -1;
   float sevenDayPct = -1;
+  int sevenDayResetMin = -1;
   bool needsInput = false; // waiting on a permission/approval prompt
 };
 
@@ -149,8 +151,10 @@ struct CodexStatus {
   String status = "unknown";
   long tokensToday = 0;
   float primaryPct = -1;
+  int primaryWindowMin = -1;
   int primaryResetMin = -1;
   float weeklyPct = -1;
+  int weeklyWindowMin = -1;
   int weeklyResetMin = -1;
   bool needsInput = false;
 };
@@ -279,14 +283,6 @@ bool currentAppNeedsInput() {
   return currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput;
 }
 
-// Working vs idle is now conveyed by the sprite animation itself (moving vs
-// still), not by ring color. The ring just stays steady green, except
-// bridge-stale which flashes red ("check it now") and overrides everything.
-uint16_t currentStatusColor() {
-  if (bridgeStale()) return flashOn ? TFT_RED : TFT_BLACK;
-  return TFT_GREEN;
-}
-
 // Paints the full square border in one color (all four sides), used for the
 // attention flash so the whole edge blinks, not just the filled quota arc.
 void drawFullBorder(uint16_t color) {
@@ -296,49 +292,6 @@ void drawFullBorder(uint16_t color) {
   tft.fillRect(x0, SCREEN_H - RING_MARGIN - RING_THICKNESS, side, RING_THICKNESS, color); // bottom
   tft.fillRect(x0, y0, RING_THICKNESS, side, color);                              // left
   tft.fillRect(SCREEN_W - RING_MARGIN - RING_THICKNESS, y0, RING_THICKNESS, side, color); // right
-}
-
-// Square progress ring hugging the screen edge. `pct` of the perimeter
-// (clockwise from top-left) is drawn in `color`, the rest in dark grey.
-void drawSquareRing(float pct, uint16_t color) {
-  int x0 = RING_MARGIN, y0 = RING_MARGIN;
-  int x1 = SCREEN_W - RING_MARGIN, y1 = SCREEN_H - RING_MARGIN;
-  int side = x1 - x0;
-  float perimeter = side * 4.0;
-
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-
-  // Unfilled track is drawn black (not grey) so it blends into the background
-  // and only the active quota portion is visible - still needs to be actively
-  // repainted each time though, to erase a previously longer fill if the
-  // percentage drops (e.g. a quota window reset).
-  tft.fillRect(x0, y0, side, RING_THICKNESS, TFT_BLACK);                  // top
-  tft.fillRect(x1 - RING_THICKNESS, y0, RING_THICKNESS, side, TFT_BLACK); // right
-  tft.fillRect(x0, y1 - RING_THICKNESS, side, RING_THICKNESS, TFT_BLACK); // bottom
-  tft.fillRect(x0, y0, RING_THICKNESS, side, TFT_BLACK);                  // left
-
-  // filled portion, clockwise: top -> right -> bottom -> left
-  float remaining = perimeter * (pct / 100.0);
-  if (remaining <= 0) return;
-
-  float seg = min(remaining, (float)side);
-  tft.fillRect(x0, y0, (int)seg, RING_THICKNESS, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x1 - RING_THICKNESS, y0, RING_THICKNESS, (int)seg, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x1 - (int)seg, y1 - RING_THICKNESS, (int)seg, RING_THICKNESS, color);
-  remaining -= side;
-  if (remaining <= 0) return;
-
-  seg = min(remaining, (float)side);
-  tft.fillRect(x0, y1 - (int)seg, RING_THICKNESS, (int)seg, color);
 }
 
 void drawClaudeSprite(int frameIdx) {
@@ -355,12 +308,37 @@ String pctText(float pct) {
   return pct >= 0 ? String((int)pct) + "%" : "-";
 }
 
-// Two quota lines below the sprite: hourly (5h) window and weekly window.
-void drawQuotaText(float hourPct, float weekPct) {
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("5h " + pctText(hourPct), SCREEN_CX, 190, 2);
-  tft.drawString("Weekly " + pctText(weekPct), SCREEN_CX, 208, 2);
+// "3h" / "45m" / "2h10m" reset countdown; "" when unknown.
+String resetLabel(int m) {
+  if (m < 0) return "";
+  if (m >= 60) { int mm = m % 60; return String(m / 60) + "h" + (mm > 0 ? String(mm) + "m" : ""); }
+  return String(m) + "m";
+}
+
+// Linear-interpolate two RGB565 colors (t in 0..1).
+uint16_t lerp565(uint16_t a, uint16_t b, float t) {
+  int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+  int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+  int r = ar + (int)((br - ar) * t);
+  int g = ag + (int)((bg - ag) * t);
+  int bl = ab + (int)((bb - ab) * t);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+// One progress bar: dark track, purple->green gradient fill of length `fillPct`,
+// plus an optional time marker (light core, dark edges) at `timePct`.
+void drawQuotaBar(int x, int y, int w, int h, float fillPct, float timePct, bool hasTime) {
+  tft.fillRoundRect(x, y, w, h, h / 2, tft.color565(48, 48, 48));
+  uint16_t pur = tft.color565(125, 92, 252), grn = tft.color565(61, 214, 140);
+  int fillW = (int)(w * constrain(fillPct, 0.0f, 100.0f) / 100.0f);
+  for (int i = 0; i < fillW; i++) {
+    tft.drawFastVLine(x + i, y, h, lerp565(pur, grn, (float)i / w));
+  }
+  if (hasTime) {
+    int ax = x + (int)(w * constrain(timePct, 0.0f, 100.0f) / 100.0f);
+    tft.fillRect(ax - 2, y, 4, h, tft.color565(8, 8, 8)); // dark edge
+    tft.fillRect(ax - 1, y, 2, h, TFT_WHITE);             // light core
+  }
 }
 
 // App logo in the top-left corner (inside the quota ring) so a glance tells
@@ -387,29 +365,55 @@ float claudeRingPct() {
              : 0;
 }
 
-// Redraws whichever app is currently active, full screen: quota ring + sprite.
-void drawActiveApp() {
-  tft.fillScreen(TFT_BLACK);
+// Bottom quota panel: "5h 27%" + reset countdown, a 5h usage bar with a time
+// marker, and a thinner weekly bar with its own marker (fill = used %, the line
+// = elapsed time in that window).
+void drawQuotaBars() {
+  float fivePct, weekPct, fiveTime = 0, weekTime = 0;
+  bool fiveHasTime = false, weekHasTime = false;
+  int fiveResetMin;
   if (currentApp == APP_CLAUDE) {
-    drawSquareRing(claudeRingPct(), currentStatusColor());
-    drawClaudeSprite(claudeFrame);
-    drawQuotaText(claudeRingPct(), claudeStatus.sevenDayPct);
+    fivePct = claudeRingPct();
+    weekPct = max(claudeStatus.sevenDayPct, 0.0f);
+    if (claudeStatus.fiveHourResetMin >= 0) {
+      fiveTime = 100.0f * (300 - claudeStatus.fiveHourResetMin) / 300.0f; fiveHasTime = true;
+    } else if (claudeStatus.sessionWindowMin > 0) {
+      fiveTime = 100.0f * claudeStatus.sessionMin / claudeStatus.sessionWindowMin; fiveHasTime = true;
+    }
+    if (claudeStatus.sevenDayResetMin >= 0) {
+      weekTime = 100.0f * (10080 - claudeStatus.sevenDayResetMin) / 10080.0f; weekHasTime = true;
+    }
+    fiveResetMin = claudeStatus.fiveHourResetMin;
   } else {
-    drawSquareRing(max(codexStatus.primaryPct, 0.0f), currentStatusColor());
-    drawCodexSprite(codexFrame);
-    drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct);
+    fivePct = max(codexStatus.primaryPct, 0.0f);
+    weekPct = max(codexStatus.weeklyPct, 0.0f);
+    if (codexStatus.primaryResetMin >= 0 && codexStatus.primaryWindowMin > 0) {
+      fiveTime = 100.0f * (codexStatus.primaryWindowMin - codexStatus.primaryResetMin) / codexStatus.primaryWindowMin;
+      fiveHasTime = true;
+    }
+    if (codexStatus.weeklyResetMin >= 0 && codexStatus.weeklyWindowMin > 0) {
+      weekTime = 100.0f * (codexStatus.weeklyWindowMin - codexStatus.weeklyResetMin) / codexStatus.weeklyWindowMin;
+      weekHasTime = true;
+    }
+    fiveResetMin = codexStatus.primaryResetMin;
   }
-  drawAppLogo();
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("5h " + pctText(fivePct), 20, 178, 2);
+  tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(resetLabel(fiveResetMin), 220, 178, 2);
+  drawQuotaBar(20, 196, 200, 9, fivePct, fiveTime, fiveHasTime);
+  drawQuotaBar(20, 217, 200, 6, weekPct, weekTime, weekHasTime);
 }
 
-// Redraws just the ring (cheap) - used for status color animation ticks
-// between full redraws.
-void redrawRingOnly() {
-  if (currentApp == APP_CLAUDE) {
-    drawSquareRing(claudeRingPct(), currentStatusColor());
-  } else {
-    drawSquareRing(max(codexStatus.primaryPct, 0.0f), currentStatusColor());
-  }
+// Redraws whichever app is currently active, full screen: sprite + quota bars.
+void drawActiveApp() {
+  tft.fillScreen(TFT_BLACK);
+  if (currentApp == APP_CLAUDE) drawClaudeSprite(claudeFrame);
+  else drawCodexSprite(codexFrame);
+  drawQuotaBars();
+  drawAppLogo();
 }
 
 // Who gets the screen:
@@ -855,7 +859,9 @@ bool parseStatusJson(const String &payload) {
     claudeStatus.sessionMin = c["session_min"] | 0;
     claudeStatus.sessionWindowMin = c["session_window_min"] | 300;
     claudeStatus.fiveHourPct = c["five_hour_pct"] | -1.0;
+    claudeStatus.fiveHourResetMin = c["five_hour_reset_min"] | -1;
     claudeStatus.sevenDayPct = c["seven_day_pct"] | -1.0;
+    claudeStatus.sevenDayResetMin = c["seven_day_reset_min"] | -1;
     claudeStatus.needsInput = c["needs_input"] | false;
   }
 
@@ -864,8 +870,10 @@ bool parseStatusJson(const String &payload) {
     codexStatus.status = x["status"] | "unknown";
     codexStatus.tokensToday = x["tokens_today"] | 0;
     codexStatus.primaryPct = x["primary_pct"] | -1.0;
+    codexStatus.primaryWindowMin = x["primary_window_min"] | -1;
     codexStatus.primaryResetMin = x["primary_reset_min"] | -1;
     codexStatus.weeklyPct = x["weekly_pct"] | -1.0;
+    codexStatus.weeklyWindowMin = x["weekly_window_min"] | -1;
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
     codexStatus.needsInput = x["needs_input"] | false;
   }
@@ -1630,13 +1638,10 @@ void loop() {
     if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
       lastFlashMs = nowMs;
       flashOn = !flashOn;
-      if (bridgeStale()) {
-        redrawRingOnly();
-      } else if (currentAppNeedsInput()) {
-        // approval needed: blink the whole border red, restore the quota ring
-        // on the off-phase so it doesn't erase the normal chrome permanently
-        if (flashOn) drawFullBorder(TFT_RED);
-        else redrawRingOnly();
+      // stale data or approval-needed: flash a red edge border for attention;
+      // the off-phase clears it (bars/sprite are painted on the full redraw).
+      if (bridgeStale() || currentAppNeedsInput()) {
+        drawFullBorder(flashOn ? TFT_RED : TFT_BLACK);
       }
     }
 
