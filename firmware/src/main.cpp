@@ -1386,6 +1386,7 @@ const unsigned long INFO_REPORT_INTERVAL_MS = 10000; // push our state to the re
 const unsigned long CMD_POLL_INTERVAL_MS = 3000;     // pull queued commands
 unsigned long lastInfoReportMs = 0;
 unsigned long lastCmdPollMs = 0;
+int lastReportedSpriteRev = -1; // re-upload sprite raw to the relay when this changes
 
 // POST our /api/info JSON to the relay so the Mac can read it cross-LAN.
 void reportDeviceInfo() {
@@ -1418,6 +1419,67 @@ bool applySpriteFromRelay(ActiveApp slot) {
   f.close();
   http.end();
   return applyDecodedGif(slot);
+}
+
+// Synthesize a built-in slot's sprite raw ([count][RGB565 frames]) into `path`.
+// PROGMEM frames are copied through a small RAM buffer (flash can't be memcpy'd
+// directly). Custom sprites don't need this — their .bin file already IS the raw.
+bool writeBuiltinSpriteRaw(ActiveApp slot, const char *path) {
+  int frames = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FRAMES : CODEX_SPRITE_FRAMES;
+  int w = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_W : CODEX_SPRITE_W;
+  int h = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_H : CODEX_SPRITE_H;
+  const uint16_t *const *arr = (slot == APP_CLAUDE) ? claude_sprite_frames : codex_sprite_frames;
+  size_t frameBytes = (size_t)w * h * 2;
+  File f = LittleFS.open(path, "w");
+  if (!f) return false;
+  uint8_t cnt = (uint8_t)frames;
+  f.write(cnt);
+  uint8_t buf[256];
+  for (int i = 0; i < frames; i++) {
+    const uint8_t *src = (const uint8_t *)arr[i];
+    size_t off = 0;
+    while (off < frameBytes) {
+      size_t n = frameBytes - off;
+      if (n > sizeof(buf)) n = sizeof(buf);
+      memcpy_P(buf, src + off, n);
+      f.write(buf, n);
+      off += n;
+      yield();
+    }
+  }
+  f.close();
+  return true;
+}
+
+// POST a slot's current sprite raw to the relay so the Mac mirror can show the
+// exact animation on screen even cross-LAN.
+void reportSprite(ActiveApp slot) {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  bool custom = (slot == APP_CLAUDE) ? claudeCustom : codexCustom;
+  const char *slotName = (slot == APP_CLAUDE) ? "claude" : "codex";
+  const char *binPath = (slot == APP_CLAUDE) ? CLAUDE_SPRITE_FILE : CODEX_SPRITE_FILE;
+  const char *tmpPath = "/sprite_up.tmp";
+  const char *srcPath;
+  if (custom && LittleFS.exists(binPath)) {
+    srcPath = binPath; // custom .bin is already the wire raw
+  } else {
+    if (!writeBuiltinSpriteRaw(slot, tmpPath)) return;
+    srcPath = tmpPath;
+  }
+  File f = LittleFS.open(srcPath, "r");
+  if (f) {
+    WiFiClient client;
+    HTTPClient http;
+    String url = "http://" + bridgeHost + "/sprite/" + slotName;
+    http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+    if (http.begin(client, url)) {
+      http.addHeader("Content-Type", "application/octet-stream");
+      http.sendRequest("POST", &f, f.size());
+      http.end();
+    }
+    f.close();
+  }
+  if (srcPath == tmpPath) LittleFS.remove(tmpPath);
 }
 
 // Pull queued commands from the relay and apply each locally. The relay returns
@@ -1598,5 +1660,13 @@ void loop() {
   if (nowMs - lastCmdPollMs >= CMD_POLL_INTERVAL_MS) {
     lastCmdPollMs = nowMs;
     pollCommands();
+  }
+  // Re-upload sprite raw to the relay when it changes (and once after connect),
+  // so the Mac mirror can show the on-screen animation cross-LAN.
+  if (WiFi.status() == WL_CONNECTED && bridgeHost.length() > 0 &&
+      spriteRev != lastReportedSpriteRev) {
+    lastReportedSpriteRev = spriteRev;
+    reportSprite(APP_CLAUDE);
+    reportSprite(APP_CODEX);
   }
 }
