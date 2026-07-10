@@ -25,8 +25,10 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 
 cp "$BIN" "$OUT/Contents/MacOS/${APP_NAME}"
-# Resource bundle at the app root, where Bundle.module resolves it.
-[ -d "$RESBUNDLE" ] && cp -R "$RESBUNDLE" "$OUT/${APP_NAME}_${APP_NAME}.bundle"
+# Resource PNGs go into Contents/Resources so the .app is a clean, codesign-able
+# bundle (nothing unsealed at the root). AppResources.image loads them via
+# Bundle.main; SwiftPM's Bundle.module is only the `swift run` fallback.
+[ -d "$RESBUNDLE" ] && cp "$RESBUNDLE"/*.png "$OUT/Contents/Resources/" 2>/dev/null || true
 
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,7 +56,17 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> ad-hoc codesign"
-codesign --force --deep --sign - "$OUT" 2>/dev/null || echo "(codesign 跳过/失败,本机仍可运行)"
+echo "==> codesign"
+# A STABLE signing identity keeps the app's designated requirement constant
+# across rebuilds, so macOS Keychain "Always Allow" grants (e.g. for reading the
+# Claude Code credential) persist instead of being revoked on every re-sign.
+# Create one once with:  ./make-signing-cert.sh   (falls back to ad-hoc if absent).
+IDENTITY="AIClock Self Signed"
+if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+  codesign --force --sign "$IDENTITY" "$OUT" && echo "    signed with stable identity: $IDENTITY"
+else
+  codesign --force --sign - "$OUT" 2>/dev/null \
+    && echo "    ad-hoc signed (run ./make-signing-cert.sh for a stable identity so Keychain grants persist)"
+fi
 
 echo "==> done: $OUT"
