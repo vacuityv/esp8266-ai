@@ -50,6 +50,7 @@ _store = {}          # telemetry key -> (bytes, ts)
 _deviceinfo = None   # (bytes, ts) reported by the clock
 _commands = []       # list of command dicts, Mac -> clock
 _gifs = {}           # slot -> bytes, Mac -> clock
+_sprites = {}        # slot -> (bytes, ts), the clock's current sprite raw (for the Mac mirror)
 
 
 def eq(a: str, b: str) -> bool:
@@ -102,6 +103,7 @@ class Handler(BaseHTTPRequestHandler):
                 lines.append(f"deviceinfo {di}")
                 lines.append(f"commands  {len(_commands)} pending")
                 lines.append(f"gifs      {sorted(_gifs)}")
+                lines.append(f"sprites   { {k: len(v[0]) for k, v in _sprites.items()} }")
             return self._send(200, "aiclock-relay ok\n\n" + "\n".join(lines) + "\n")
 
         # Mac reads device info (Bearer)
@@ -114,6 +116,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "no device info yet")
             body, ts = di
             return self._send(200, body, JSON, {"X-Relay-Age": str(int(time.time() - ts))})
+
+        # Mac reads the clock's current sprite raw for the mirror (Bearer)
+        if path.startswith("/control/sprite/"):
+            if not self._bearer_ok():
+                return self._send(403, "forbidden")
+            with _lock:
+                sp = _sprites.get(path[len("/control/sprite/"):])
+            if sp is None:
+                return self._send(404, "no sprite yet")
+            return self._send(200, sp[0], BIN)
 
         # Clock pulls (capability path /r/<secret>/...)
         if path.startswith("/r/"):
@@ -195,6 +207,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_body()
                 with _lock:
                     _deviceinfo = (body, time.time())
+                return self._send(200, "ok")
+            if sub.startswith("sprite/"):            # clock uploads its sprite raw
+                slot = sub[len("sprite/"):]
+                body = self._read_body()
+                with _lock:
+                    _sprites[slot] = (body, time.time())
                 return self._send(200, "ok")
             return self._send(404, "no such route")
 

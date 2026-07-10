@@ -146,12 +146,20 @@ final class DeviceClient {
     /// GET /sprite/{claude|codex}/raw — the animation the device is actually
     /// using, wire format [1 byte frame count][RGB565 big-endian frames...].
     static func fetchSpriteRaw(slot: String, completion: @escaping (Result<Data, Error>) -> Void) {
-        guard let base = baseURL else {
+        let url: URL
+        var bearer: String? = nil
+        if let relay = relayControl {
+            url = relay.base.appendingPathComponent("control/sprite/\(slot)")
+            bearer = relay.token
+        } else if let base = baseURL {
+            url = base.appendingPathComponent("sprite/\(slot)/raw")
+        } else {
             completion(.failure(Self.noHostError))
             return
         }
-        var req = URLRequest(url: base.appendingPathComponent("sprite/\(slot)/raw"))
+        var req = URLRequest(url: url)
         req.timeoutInterval = 30
+        if let bearer = bearer { req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
         URLSession.shared.dataTask(with: req) { data, resp, error in
             var result: Result<Data, Error>
             if let error = error {
