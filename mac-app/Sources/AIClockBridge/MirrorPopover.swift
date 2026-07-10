@@ -378,6 +378,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var spriteCache: [String: (rev: Int, frames: [CGImage], w: Int, h: Int)] = [:]
     private var lastInfo: DeviceInfo?
     private var fetchingSlot: String?
+    // Optimistic mode selection: relay control is eventually-consistent (the
+    // device polls commands every ~3s and reports back every ~10s), so after the
+    // user picks a mode we hold the segment on their choice until the device
+    // confirms it — otherwise the 1s poll snaps it back to the old reported mode.
+    private var pendingMode: String?
+    private var pendingModeSince: Date?
 
     init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor) {
         self.service = service
@@ -475,12 +481,24 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.mirror.deviceOK = true
                 self.applyScene(info)
                 self.ensureSprite(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3, "music": 4][info.mode] ?? 0
+                // Clear the pending pick once the device confirms it (or times out).
+                if let pending = self.pendingMode {
+                    if info.mode == pending {
+                        self.pendingMode = nil
+                        self.pendingModeSince = nil
+                    } else if let since = self.pendingModeSince, Date().timeIntervalSince(since) > 15 {
+                        self.pendingMode = nil // gave up waiting; trust the device
+                        self.pendingModeSince = nil
+                    }
+                }
+                let shown = self.pendingMode ?? info.mode
+                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3, "music": 4][shown] ?? 0
                 self.modeControl.selectedSegment = modeIdx
-                let modeText = info.mode == "auto" ? "自动切换"
-                    : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
-                self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
+                let modeText = shown == "auto" ? "自动切换"
+                    : shown == "net" ? "网速曲线"
+                    : shown == "music" ? "音乐播放" : "固定显示"
+                let pendingNote = self.pendingMode != nil ? "（切换中…）" : ""
+                self.statusLabel.stringValue = "\(info.ip) · \(modeText)\(pendingNote) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
                 self.mirror.needsDisplay = true
@@ -598,6 +616,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
     @objc private func modeChanged() {
         let mode = ["auto", "claude", "codex", "net", "music"][max(0, modeControl.selectedSegment)]
+        // Hold the segment on this pick until the device confirms it, so the 1s
+        // poll doesn't snap it back during the relay's control round-trip.
+        pendingMode = mode
+        pendingModeSince = Date()
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }
