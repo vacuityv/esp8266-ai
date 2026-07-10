@@ -22,8 +22,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         self.service = service
         self.usage = usage
         self.port = port
-        self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
-                                                     nowPlaying: nowPlaying)
+        self.mirrorPopover = MirrorPopoverController(service: service, usage: usage,
+                                                     netMonitor: netMonitor, nowPlaying: nowPlaying)
         super.init()
         buildMenu()
         if let button = statusItem.button {
@@ -38,7 +38,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     /// dot). Full-color, so NOT a template image — it keeps its colors in
     /// both light and dark menu bars.
     private static func retroMacIcon() -> NSImage {
-        guard let img = Bundle.module.image(forResource: "happy-mac") else {
+        guard let img = AppResources.image("happy-mac") else {
             return NSImage(size: NSSize(width: 18, height: 18))
         }
         img.size = NSSize(width: 18, height: 18)

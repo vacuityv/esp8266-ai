@@ -71,7 +71,11 @@ final class MirrorView: NSView {
     var frames: [CGImage] = []
     var frameIdx = 0
     var spriteW = 120, spriteH = 120
-    var ringPct: Double = 0
+    var ringPct: Double = 0      // 5h usage bar fill %
+    var timePct: Double = 0      // time arrow position: elapsed fraction of the 5h window
+    var weeklyPct: Double = 0    // weekly usage bar fill %
+    var weeklyTimePct: Double? = nil // weekly time marker (elapsed in the 7d window), nil = hide
+    var resetText = ""           // 5h reset countdown, e.g. "2h29m"
     var needsInput = false // shown app waiting on approval -> red border flash
     var flashOn = false
     var line1 = "5h -"
@@ -116,10 +120,48 @@ final class MirrorView: NSView {
     var musicPlaying = false
     var musicCover: CGImage?
 
-    private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
-    private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
+    private static let claudeLogo = AppResources.image("claude-logo")
+    private static let codexLogo = AppResources.image("codex-logo")
 
     override var isFlipped: Bool { true } // draw in the panel's top-left origin
+
+    /// A rounded progress bar: track + gradient fill whose length is `pct`.
+    /// If `arrowPct` is set, draws a small arrow below it marking that position
+    /// (used for the 5h bar's time-progress; the weekly bar passes nil).
+    private func drawBar(pct: Double, arrowPct: Double?, x: CGFloat, y: CGFloat,
+                         w: CGFloat, h: CGFloat) {
+        let track = NSBezierPath(roundedRect: NSRect(x: x, y: y, width: w, height: h),
+                                 xRadius: h / 2, yRadius: h / 2)
+        NSColor(calibratedWhite: deviceOK ? 0.20 : 0.12, alpha: 1).setFill()
+        track.fill()
+
+        let fillW = w * CGFloat(max(0, min(pct, 100)) / 100)
+        if fillW > 0.5 {
+            NSGraphicsContext.saveGraphicsState()
+            track.setClip() // rounded left cap, flat cut on the right
+            let fillRect = NSRect(x: x, y: y, width: fillW, height: h)
+            if deviceOK {
+                NSGradient(colors: [NSColor(calibratedRed: 0.49, green: 0.36, blue: 0.99, alpha: 1),
+                                    NSColor(calibratedRed: 0.24, green: 0.84, blue: 0.55, alpha: 1)])?
+                    .draw(in: fillRect, angle: 0)
+            } else {
+                NSColor.gray.setFill()
+                fillRect.fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
+
+        // time-progress marker: a vertical line with a light core and dark edges
+        // so it stays visible on both the bright fill and the dark track. Kept
+        // within the bar height (no overhang).
+        if let ap = arrowPct {
+            let ax = x + w * CGFloat(max(0, min(ap, 100)) / 100)
+            NSColor(calibratedWhite: 0.05, alpha: 0.9).setFill()
+            NSRect(x: ax - 2, y: y, width: 4, height: h).fill()
+            (deviceOK ? NSColor.white : NSColor.lightGray).setFill()
+            NSRect(x: ax - 1, y: y, width: 2, height: h).fill()
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
@@ -145,26 +187,6 @@ final class MirrorView: NSView {
             return
         }
 
-        // square quota ring: margin 4, thickness 10, clockwise from top-left
-        let m: CGFloat = 4, t: CGFloat = 10
-        let side: CGFloat = 240 - 2 * m
-        let color = deviceOK ? NSColor(calibratedRed: 0, green: 0.85, blue: 0.2, alpha: 1)
-                             : NSColor.darkGray
-        color.setFill()
-        var remaining = side * 4 * CGFloat(max(0, min(ringPct, 100)) / 100)
-        let x0 = m, y0 = m, x1 = 240 - m
-        var seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x0, y: y0, width: seg, height: t).fill() }          // top
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x1 - t, y: y0, width: t, height: seg).fill() }      // right
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x1 - seg, y: 240 - m - t, width: seg, height: t).fill() } // bottom
-        remaining -= side
-        seg = min(remaining, side)
-        if seg > 0 { NSRect(x: x0, y: 240 - m - seg, width: t, height: seg).fill() }     // left
-
         // sprite, centered, pixel-crisp
         if !frames.isEmpty {
             let img = frames[min(frameIdx, frames.count - 1)]
@@ -185,16 +207,20 @@ final class MirrorView: NSView {
             (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 40, height: 40))
         }
 
-        // quota text
+        // bottom panel: "5h 27%" (left) + reset countdown (right), then the 5h
+        // usage bar with its time arrow, then a thin weekly bar (fill only).
         let style = NSMutableParagraphStyle()
         style.alignment = .center
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: style,
-        ]
-        (line1 as NSString).draw(in: NSRect(x: 0, y: 188, width: 240, height: 18), withAttributes: attrs)
-        (line2 as NSString).draw(in: NSRect(x: 0, y: 206, width: 240, height: 18), withAttributes: attrs)
+        let leftStyle = NSMutableParagraphStyle(); leftStyle.alignment = .left
+        let rightStyle = NSMutableParagraphStyle(); rightStyle.alignment = .right
+        let labelFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        (line1 as NSString).draw(in: NSRect(x: 20, y: 178, width: 130, height: 16), withAttributes: [
+            .font: labelFont, .foregroundColor: NSColor.white, .paragraphStyle: leftStyle])
+        (resetText as NSString).draw(in: NSRect(x: 90, y: 178, width: 130, height: 16), withAttributes: [
+            .font: labelFont, .foregroundColor: NSColor(calibratedWhite: 0.62, alpha: 1),
+            .paragraphStyle: rightStyle])
+        drawBar(pct: ringPct, arrowPct: timePct, x: 20, y: 196, w: 200, h: 9)          // 5h + time marker
+        drawBar(pct: weeklyPct, arrowPct: weeklyTimePct, x: 20, y: 217, w: 200, h: 6)  // weekly + time marker
 
         if !deviceOK {
             let overlay: [NSAttributedString.Key: Any] = [
@@ -364,6 +390,7 @@ final class MirrorView: NSView {
 
 final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let service: StatusService
+    private let usage: UsageFetcher
     private let netMonitor: NetSpeedMonitor
     private let nowPlaying: NowPlayingMonitor
     private let popover = NSPopover()
@@ -385,8 +412,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var pendingMode: String?
     private var pendingModeSince: Date?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor) {
+    init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
+         nowPlaying: NowPlayingMonitor) {
         self.service = service
+        self.usage = usage
         self.netMonitor = netMonitor
         self.nowPlaying = nowPlaying
         super.init()
@@ -429,6 +458,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            usage.refresh() // pull fresh quota so the bars aren't up to 120s stale
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             startTimers()
             tick()
@@ -538,13 +568,36 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 ?? (snap.claude.sessionWindowMin > 0
                     ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
             mirror.ringPct = pct
+            // Outer ring: how far into the 5h window we are (time until reset).
+            // Prefer the real reset countdown; fall back to session elapsed.
+            let win = Double(max(snap.claude.sessionWindowMin, 1))
+            if let r = snap.claude.fiveHourResetMin, r >= 0 {
+                mirror.timePct = 100.0 * (win - Double(r)) / win
+            } else {
+                mirror.timePct = 100.0 * Double(snap.claude.sessionMin) / win
+            }
             mirror.line1 = "5h " + Self.pctText(pct)
-            mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
+            mirror.weeklyPct = snap.claude.sevenDayPct ?? 0
+            mirror.weeklyTimePct = snap.claude.sevenDayResetMin.map {
+                100.0 * Double(10080 - $0) / 10080.0  // 7d window = 10080 min
+            }
+            mirror.resetText = Self.resetLabel(snap.claude.fiveHourResetMin)
             mirror.needsInput = snap.claude.needsInput
         } else {
             mirror.ringPct = snap.codex.primaryPct ?? 0
+            if let r = snap.codex.primaryResetMin, r >= 0, let w = snap.codex.primaryWindowMin, w > 0 {
+                mirror.timePct = 100.0 * Double(w - r) / Double(w)
+            } else {
+                mirror.timePct = 0
+            }
             mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
-            mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+            mirror.weeklyPct = snap.codex.weeklyPct ?? 0
+            if let r = snap.codex.weeklyResetMin, r >= 0, let wm = snap.codex.weeklyWindowMin, wm > 0 {
+                mirror.weeklyTimePct = 100.0 * Double(wm - r) / Double(wm)
+            } else {
+                mirror.weeklyTimePct = nil
+            }
+            mirror.resetText = Self.resetLabel(snap.codex.primaryResetMin)
             mirror.needsInput = snap.codex.needsInput
         }
         mirror.needsDisplay = true
@@ -553,6 +606,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private static func pctText(_ pct: Double?) -> String {
         guard let p = pct, p >= 0 else { return "-" }
         return "\(Int(p))%"
+    }
+
+    /// Reset countdown: "3h" / "45m" / "2h10m", or "" when unknown.
+    private static func resetLabel(_ min: Int?) -> String {
+        guard let m = min, m >= 0 else { return "" }
+        if m >= 60 { return "\(m / 60)h" + (m % 60 > 0 ? "\(m % 60)m" : "") }
+        return "\(m)m"
     }
 
     private func ensureSprite(_ info: DeviceInfo) {
