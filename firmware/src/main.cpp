@@ -1436,7 +1436,9 @@ void pollCommands() {
 
   JsonDocument doc;
   if (deserializeJson(doc, payload)) return; // parse error -> ignore
-  for (JsonObject cmd : doc.as<JsonArray>()) {
+  JsonArray cmds = doc.as<JsonArray>();
+  if (cmds.size() == 0) return;
+  for (JsonObject cmd : cmds) {
     const char *type = cmd["type"] | "";
     if (strcmp(type, "display") == 0) {
       String mode = cmd["mode"] | "auto";
@@ -1452,6 +1454,10 @@ void pollCommands() {
       if (strlen(host) > 0) { bridgeHost = host; saveBridgeHost(bridgeHost); }
     }
   }
+  // Report right after applying so the Mac sees the new state fast instead of
+  // waiting for the next periodic report.
+  reportDeviceInfo();
+  lastInfoReportMs = millis();
 }
 
 void setupWebServer() {
