@@ -9,6 +9,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266mDNS.h>
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
@@ -1577,14 +1578,19 @@ void setup() {
 
   setupWiFi();
   setupWebServer();
+  // Advertise http://aiclock.local so the admin page is reachable by name
+  // (no IP hunting). macOS/iOS resolve .local natively via Bonjour.
+  if (MDNS.begin("aiclock")) MDNS.addService("http", "tcp", 80);
 
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("WiFi connected", 8, 70, 2);
-  tft.drawString("Admin page:", 8, 100, 2);
+  tft.drawString("WiFi connected", 8, 66, 2);
+  tft.drawString("Admin page:", 8, 94, 2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("http://" + WiFi.localIP().toString(), 8, 125, 2);
+  tft.drawString("aiclock.local", 8, 116, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("or " + WiFi.localIP().toString(), 8, 140, 2);
   delay(3000);
 
   drawStaticChrome();
@@ -1594,6 +1600,7 @@ void setup() {
 
 void loop() {
   webServer.handleClient();
+  MDNS.update();
   unsigned long nowMs = millis();
 
   // Effective mode may differ from the configured one (AUTO -> music while
