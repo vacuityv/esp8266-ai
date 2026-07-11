@@ -369,6 +369,9 @@ float claudeRingPct() {
 // marker, and a thinner weekly bar with its own marker (fill = used %, the line
 // = elapsed time in that window).
 void drawQuotaBars() {
+  // No black clear here: the bars overwrite themselves (the track fills the whole
+  // bar) and the labels are space-padded to erase old chars, so refreshing this
+  // panel each poll doesn't blank anything and there's no flicker.
   float fivePct, weekPct, fiveTime = 0, weekTime = 0;
   bool fiveHasTime = false, weekHasTime = false;
   int fiveResetMin;
@@ -397,12 +400,16 @@ void drawQuotaBars() {
     }
     fiveResetMin = codexStatus.primaryResetMin;
   }
+  String lbl = pctText(fivePct);
+  while (lbl.length() < 4) lbl += ' ';   // trailing pad erases a longer old value
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString(pctText(fivePct), 20, 178, 2);
+  tft.drawString(lbl, 20, 178, 2);
+  String rl = resetLabel(fiveResetMin);
+  while (rl.length() < 6) rl = ' ' + rl; // leading pad for the right-aligned text
   tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
   tft.setTextDatum(TR_DATUM);
-  tft.drawString(resetLabel(fiveResetMin), 220, 178, 2);
+  tft.drawString(rl, 220, 178, 2);
   drawQuotaBar(20, 196, 200, 9, fivePct, fiveTime, fiveHasTime);
   drawQuotaBar(20, 217, 200, 6, weekPct, weekTime, weekHasTime);
 }
@@ -927,8 +934,13 @@ void pollBridge() {
   http.end();
   DisplayMode eff = effectiveMode();
   if (eff != MODE_NET && eff != MODE_MUSIC) {
-    updateActiveApp();
-    drawActiveApp();
+    // Only full-repaint when the shown app actually switched; otherwise just
+    // refresh the bottom quota panel so the screen doesn't flicker every poll.
+    if (updateActiveApp()) {
+      drawActiveApp();
+    } else {
+      drawQuotaBars();
+    }
   }
 }
 
