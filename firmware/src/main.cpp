@@ -399,7 +399,7 @@ void drawQuotaBars() {
   }
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString("5h " + pctText(fivePct), 20, 178, 2);
+  tft.drawString(pctText(fivePct), 20, 178, 2);
   tft.setTextColor(tft.color565(160, 160, 160), TFT_BLACK);
   tft.setTextDatum(TR_DATUM);
   tft.drawString(resetLabel(fiveResetMin), 220, 178, 2);

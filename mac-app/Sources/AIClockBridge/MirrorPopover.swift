@@ -576,7 +576,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             } else {
                 mirror.timePct = 100.0 * Double(snap.claude.sessionMin) / win
             }
-            mirror.line1 = "5h " + Self.pctText(pct)
+            mirror.line1 = Self.pctText(pct)
             mirror.weeklyPct = snap.claude.sevenDayPct ?? 0
             mirror.weeklyTimePct = snap.claude.sevenDayResetMin.map {
                 100.0 * Double(10080 - $0) / 10080.0  // 7d window = 10080 min
@@ -590,7 +590,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             } else {
                 mirror.timePct = 0
             }
-            mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
+            mirror.line1 = Self.pctText(snap.codex.primaryPct)
             mirror.weeklyPct = snap.codex.weeklyPct ?? 0
             if let r = snap.codex.weeklyResetMin, r >= 0, let wm = snap.codex.weeklyWindowMin, wm > 0 {
                 mirror.weeklyTimePct = 100.0 * Double(wm - r) / Double(wm)
