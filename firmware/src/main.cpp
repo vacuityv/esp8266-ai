@@ -10,6 +10,7 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266mDNS.h>
+#include <time.h>
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
@@ -182,6 +183,65 @@ void saveBridgeHost(const String &host) {
   File f = LittleFS.open(WIFI_CONFIG_FILE, "w");
   f.println(host);
   f.close();
+}
+
+// ---------- screen-off schedule (NTP time + backlight) ----------
+#define SCHEDULE_FILE "/schedule.cfg"
+int screenOffStart = -1; // minutes-of-day; -1 = schedule disabled
+int screenOffEnd = -1;
+bool backlightOn = true;
+unsigned long lastScheduleMs = 0;
+
+void loadSchedule() {
+  if (!LittleFS.exists(SCHEDULE_FILE)) return;
+  File f = LittleFS.open(SCHEDULE_FILE, "r");
+  if (!f) return;
+  screenOffStart = f.readStringUntil('\n').toInt();
+  screenOffEnd = f.readStringUntil('\n').toInt();
+  f.close();
+}
+
+void saveSchedule() {
+  File f = LittleFS.open(SCHEDULE_FILE, "w");
+  if (!f) return;
+  f.println(screenOffStart);
+  f.println(screenOffEnd);
+  f.close();
+}
+
+// "HH:MM" -> minutes of day; -1 if empty/invalid.
+int parseHHMM(const String &s) {
+  int c = s.indexOf(':');
+  if (c < 1) return -1;
+  int h = s.substring(0, c).toInt();
+  int m = s.substring(c + 1).toInt();
+  if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+  return h * 60 + m;
+}
+
+String fmtHHMM(int mins) {
+  if (mins < 0) return "";
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", mins / 60, mins % 60);
+  return String(buf);
+}
+
+void setBacklight(bool on) {
+  if (on == backlightOn) return;
+  backlightOn = on;
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, on ? TFT_BACKLIGHT_ON : !TFT_BACKLIGHT_ON);
+}
+
+// True when the current (NTP) local time is inside the screen-off window.
+bool inOffWindow() {
+  if (screenOffStart < 0 || screenOffEnd < 0 || screenOffStart == screenOffEnd) return false;
+  time_t now = time(nullptr);
+  if (now < 100000) return false; // NTP not synced yet -> keep the screen on
+  struct tm *t = localtime(&now);
+  int m = t->tm_hour * 60 + t->tm_min;
+  if (screenOffStart < screenOffEnd) return m >= screenOffStart && m < screenOffEnd;
+  return m >= screenOffStart || m < screenOffEnd; // overnight window (e.g. 23:00-07:00)
 }
 
 // ---------- custom sprite loading ----------
@@ -977,6 +1037,9 @@ void handleRoot() {
   html += "<form method='POST' action='/save'>";
   html += "<label>Bridge host (ip:port)</label>";
   html += "<input name='bridge' value='" + htmlEscape(bridgeHost) + "' placeholder='192.168.1.181:8765'>";
+  html += "<label style='margin-top:14px'>熄屏时段(留空 = 不熄屏)</label>";
+  html += "<div>从 <input type='time' name='off_start' style='width:auto' value='" + fmtHHMM(screenOffStart) + "'>";
+  html += " 到 <input type='time' name='off_end' style='width:auto' value='" + fmtHHMM(screenOffEnd) + "'></div>";
   html += "<button type='submit'>保存</button>";
   html += "</form>";
 
@@ -1020,6 +1083,13 @@ void handleSave() {
   bridgeHost = newHost;
   saveBridgeHost(bridgeHost);
   Serial.printf("[web] bridge host updated to '%s'\n", bridgeHost.c_str());
+
+  screenOffStart = parseHHMM(webServer.arg("off_start"));
+  screenOffEnd = parseHHMM(webServer.arg("off_end"));
+  saveSchedule();
+  Serial.printf("[web] screen-off schedule %d-%d min\n", screenOffStart, screenOffEnd);
+  setBacklight(!inOffWindow()); // apply the new schedule right away
+
   webServer.sendHeader("Location", "/");
   webServer.send(303);
 }
@@ -1570,6 +1640,7 @@ void setup() {
   Serial.begin(115200);
   LittleFS.begin();
   loadBridgeHost();
+  loadSchedule();
   loadCustomSpriteState();
 
   tft.init();
@@ -1581,6 +1652,8 @@ void setup() {
   // Advertise http://aiclock.local so the admin page is reachable by name
   // (no IP hunting). macOS/iOS resolve .local natively via Bonjour.
   if (MDNS.begin("aiclock")) MDNS.addService("http", "tcp", 80);
+  // NTP for the screen-off schedule (China UTC+8, no DST).
+  configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com", "cn.pool.ntp.org");
 
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
@@ -1602,6 +1675,12 @@ void loop() {
   webServer.handleClient();
   MDNS.update();
   unsigned long nowMs = millis();
+
+  // Screen-off schedule: turn the backlight off inside the configured window.
+  if (nowMs - lastScheduleMs >= 10000) {
+    lastScheduleMs = nowMs;
+    setBacklight(!inOffWindow());
+  }
 
   // Effective mode may differ from the configured one (AUTO -> music while
   // audio plays). On a transition, reset the incoming mode's chrome so it
