@@ -136,6 +136,8 @@ unsigned long lastFlashMs = 0;
 // Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
 // bridge discovers the device and pairs automatically (or set via /api/bridge).
 String bridgeHost;
+String deviceId;   // ESP chip id (hex), unique per device — keys the relay control channel
+String deviceName; // user-set label shown in the Mac's device picker, e.g. "家"/"公司"
 
 struct ClaudeStatus {
   String status = "unknown";
@@ -206,6 +208,25 @@ void saveSchedule() {
   if (!f) return;
   f.println(screenOffStart);
   f.println(screenOffEnd);
+  f.close();
+}
+
+// ---------- device name (shown in the Mac device picker) ----------
+#define NAME_FILE "/name.cfg"
+
+void loadDeviceName() {
+  if (!LittleFS.exists(NAME_FILE)) return;
+  File f = LittleFS.open(NAME_FILE, "r");
+  if (!f) return;
+  deviceName = f.readStringUntil('\n');
+  deviceName.trim();
+  f.close();
+}
+
+void saveDeviceName() {
+  File f = LittleFS.open(NAME_FILE, "w");
+  if (!f) return;
+  f.println(deviceName);
   f.close();
 }
 
@@ -1035,7 +1056,9 @@ void handleRoot() {
   html += "<h1>AI Clock 设置</h1>";
 
   html += "<form method='POST' action='/save'>";
-  html += "<label>Bridge host (ip:port)</label>";
+  html += "<label>设备名称(如 家 / 公司)</label>";
+  html += "<input name='name' value='" + htmlEscape(deviceName) + "' placeholder='家'>";
+  html += "<label style='margin-top:14px'>Bridge host (ip:port)</label>";
   html += "<input name='bridge' value='" + htmlEscape(bridgeHost) + "' placeholder='192.168.1.181:8765'>";
   html += "<label style='margin-top:14px'>熄屏时段(留空 = 不熄屏)</label>";
   html += "<div>从 <input type='time' name='off_start' style='width:auto' value='" + fmtHHMM(screenOffStart) + "'>";
@@ -1078,11 +1101,15 @@ void handleRoot() {
 }
 
 void handleSave() {
+  deviceName = webServer.arg("name");
+  deviceName.trim();
+  saveDeviceName();
+
   String newHost = webServer.arg("bridge");
   newHost.trim();
   bridgeHost = newHost;
   saveBridgeHost(bridgeHost);
-  Serial.printf("[web] bridge host updated to '%s'\n", bridgeHost.c_str());
+  Serial.printf("[web] name='%s' bridge='%s'\n", deviceName.c_str(), bridgeHost.c_str());
 
   screenOffStart = parseHHMM(webServer.arg("off_start"));
   screenOffEnd = parseHHMM(webServer.arg("off_end"));
@@ -1104,10 +1131,37 @@ const char *displayModeName(DisplayMode m) {
   return "auto";
 }
 
+// Persist the chosen display mode so it survives reboots (otherwise a power
+// blip resets it to AUTO, which looks like the mode "changing by itself").
+#define MODE_FILE "/mode.cfg"
+
+void saveDisplayMode() {
+  File f = LittleFS.open(MODE_FILE, "w");
+  if (!f) return;
+  f.println(displayModeName(displayMode));
+  f.close();
+}
+
+void loadDisplayMode() {
+  if (!LittleFS.exists(MODE_FILE)) return;
+  File f = LittleFS.open(MODE_FILE, "r");
+  if (!f) return;
+  String m = f.readStringUntil('\n');
+  m.trim();
+  f.close();
+  if (m == "claude") displayMode = MODE_CLAUDE;
+  else if (m == "codex") displayMode = MODE_CODEX;
+  else if (m == "net") displayMode = MODE_NET;
+  else if (m == "music") displayMode = MODE_MUSIC;
+  else displayMode = MODE_AUTO;
+}
+
 // Same JSON the /api/info route returns. Shared so the relay reporter can push
 // the identical payload up (the Mac parses it the same either way).
 String buildDeviceInfoJson() {
   JsonDocument doc;
+  doc["id"] = deviceId;
+  doc["name"] = deviceName;
   doc["ip"] = WiFi.localIP().toString();
   doc["ssid"] = WiFi.SSID();
   doc["bridge"] = bridgeHost;
@@ -1147,6 +1201,7 @@ bool applyDisplayMode(const String &mode) {
   else if (mode == "music") displayMode = MODE_MUSIC;
   else return false;
   Serial.printf("[display] mode = %s\n", mode.c_str());
+  saveDisplayMode();
   if (displayMode == MODE_NET) {
     netChromeDrawn = false;
     lastNetPollMs = 0; // poll + draw on the next loop tick
@@ -1499,7 +1554,7 @@ bool applySpriteFromRelay(ActiveApp slot) {
   const char *slotName = (slot == APP_CLAUDE) ? "claude" : "codex";
   WiFiClient client;
   HTTPClient http;
-  String url = "http://" + bridgeHost + "/gif/" + slotName;
+  String url = "http://" + bridgeHost + "/gif/" + slotName + "?id=" + deviceId;
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return false;
   int code = http.GET();
@@ -1561,7 +1616,7 @@ void reportSprite(ActiveApp slot) {
   if (f) {
     WiFiClient client;
     HTTPClient http;
-    String url = "http://" + bridgeHost + "/sprite/" + slotName;
+    String url = "http://" + bridgeHost + "/sprite/" + slotName + "?id=" + deviceId;
     http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
     if (http.begin(client, url)) {
       http.addHeader("Content-Type", "application/octet-stream");
@@ -1579,7 +1634,7 @@ void pollCommands() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
   WiFiClient client;
   HTTPClient http;
-  String url = "http://" + bridgeHost + "/commands";
+  String url = "http://" + bridgeHost + "/commands?id=" + deviceId;
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return;
   int code = http.GET();
@@ -1641,6 +1696,9 @@ void setup() {
   LittleFS.begin();
   loadBridgeHost();
   loadSchedule();
+  loadDisplayMode();
+  loadDeviceName();
+  deviceId = String(ESP.getChipId(), HEX);
   loadCustomSpriteState();
 
   tft.init();
