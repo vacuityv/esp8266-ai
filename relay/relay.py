@@ -147,6 +147,11 @@ class Handler(BaseHTTPRequestHandler):
             slot = path[len("/control/sprite/"):]
             with _lock:
                 sp = _sprites.get(f"{self._qs_id()}/{slot}")
+                if sp is None:  # old-firmware device didn't upload with an id —
+                    for k, v in _sprites.items():  # fall back to any device's same
+                        if k.endswith(f"/{slot}"):  # built-in sprite (they're shared)
+                            sp = v
+                            break
             if sp is None:
                 return self._send(404, "no sprite yet")
             return self._send(200, sp[0], BIN)
