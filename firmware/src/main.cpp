@@ -131,6 +131,7 @@ int codexFrame = 0;
 unsigned long lastAnimMs = 0;
 
 bool flashOn = true;
+bool borderShown = false; // whether the red attention border is currently drawn
 unsigned long lastFlashMs = 0;
 
 // Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
@@ -524,10 +525,15 @@ bool updateActiveApp() {
   } else {
     bool claudeWorking = claudeStatus.status == "working";
     bool codexWorking = codexStatus.status == "working";
+    // Only treat Codex as a real app to show if it's actually in use; otherwise
+    // AUTO would keep flipping to a Codex screen the user never set up.
+    bool codexActive = codexStatus.status != "offline" && codexStatus.status != "unknown";
     if (claudeWorking && !codexWorking) {
       desired = APP_CLAUDE;
     } else if (codexWorking && !claudeWorking) {
       desired = APP_CODEX;
+    } else if (!codexActive) {
+      desired = APP_CLAUDE; // Codex not in use -> just stay on Claude, no flipping
     } else {
       unsigned long interval = (claudeWorking && codexWorking) ? SWITCH_BOTH_MS : SWITCH_IDLE_MS;
       if (millis() - lastSwitchMs >= interval) {
@@ -1794,10 +1800,15 @@ void loop() {
     if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
       lastFlashMs = nowMs;
       flashOn = !flashOn;
-      // stale data or approval-needed: flash a red edge border for attention;
-      // the off-phase clears it (bars/sprite are painted on the full redraw).
+      // stale data or approval-needed: flash a red edge border for attention.
+      // When the condition clears, clear the border once (otherwise the last
+      // red frame stays stuck since nothing repaints the edge in fixed mode).
       if (bridgeStale() || currentAppNeedsInput()) {
         drawFullBorder(flashOn ? TFT_RED : TFT_BLACK);
+        borderShown = true;
+      } else if (borderShown) {
+        drawFullBorder(TFT_BLACK);
+        borderShown = false;
       }
     }
 
