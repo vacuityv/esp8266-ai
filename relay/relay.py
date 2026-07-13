@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""AI-Clock relay: bridges the Mac (behind one WiFi) and the ESP8266 clock
+"""AI-Clock relay: bridges the Mac (behind one WiFi) and the ESP8266 clock(s)
 (behind another) when they are NOT on the same LAN.
 
 Two channels, both through this one relay:
 
-  Telemetry (Mac -> clock):
-    Mac  --POST /ingest/<key>-->  [latest blob]  <--GET /r/<secret>/...--  clock
+  Telemetry (Mac -> clocks, SHARED — every clock shows the same status):
+    Mac  --POST /ingest/<key>-->  [latest blob]  <--GET /r/<secret>/...--  clocks
 
-  Control (v2, clock <-> Mac, reverse direction):
-    clock --POST /r/<secret>/deviceinfo--> [device info] <--GET /control/deviceinfo-- Mac
-    Mac   --POST /control/command--------> [cmd queue]   <--GET /r/<secret>/commands-- clock
-    Mac   --POST /control/gif/<slot>-----> [gif blob]    <--GET /r/<secret>/gif/<slot>- clock
+  Control (clock <-> Mac, PER-DEVICE — keyed by the clock's chip id so two
+  clocks don't clobber each other):
+    clock --POST /r/<secret>/deviceinfo (id in body)--> [info per id] <--GET /control/deviceinfo?id=-- Mac
+    Mac   --POST /control/command?id=--> [cmd queue per id]           <--GET /r/<secret>/commands?id=-- clock
+    Mac   --POST /control/gif/<slot>?id=--> [gif per id]              <--GET /r/<secret>/gif/<slot>?id=- clock
+    Mac   --GET  /control/devices--> [list of all known clocks]
 
 The clock authenticates with the capability path /r/<PULL_SECRET>/... (so the
 firmware just appends paths to its bridgeHost). The Mac authenticates control
@@ -27,6 +29,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("RELAY_PORT", "8080"))
 PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "")
@@ -43,14 +46,15 @@ PULL_MAP = {"status": "status", "net": "net", "music": "music",
 PUSH_MAP = {"status": "status", "net": "net", "music": "music",
             "cover.raw": "cover", "text.raw": "text"}
 
-MAX_COMMANDS = 50  # cap the queue so a spamming Mac + offline clock can't grow it unbounded
+MAX_COMMANDS = 50   # per-device queue cap
+DEVICE_TTL = 600    # drop a device from the list after this many seconds silent
 
 _lock = threading.Lock()
-_store = {}          # telemetry key -> (bytes, ts)
-_deviceinfo = None   # (bytes, ts) reported by the clock
-_commands = []       # list of command dicts, Mac -> clock
-_gifs = {}           # slot -> bytes, Mac -> clock
-_sprites = {}        # slot -> (bytes, ts), the clock's current sprite raw (for the Mac mirror)
+_store = {}          # telemetry key -> (bytes, ts)   [SHARED across devices]
+_deviceinfo = {}     # device id -> (bytes, ts)
+_commands = {}       # device id -> [command dicts]
+_sprites = {}        # "id/slot"  -> (bytes, ts)
+_gifs = {}           # "id/slot"  -> bytes
 
 
 def eq(a: str, b: str) -> bool:
@@ -85,6 +89,9 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0") or "0")
         return self.rfile.read(n) if n else b""
 
+    def _qs_id(self):
+        return parse_qs(urlparse(self.path).query).get("id", [""])[0]
+
     # ---- GET ----
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -99,54 +106,72 @@ class Handler(BaseHTTPRequestHandler):
                         lines.append(f"{k:9} {len(b):>7} bytes  {now - ts:6.1f}s ago")
                     else:
                         lines.append(f"{k:9} (none)")
-                di = f"{now - _deviceinfo[1]:.1f}s ago" if _deviceinfo else "(none)"
-                lines.append(f"deviceinfo {di}")
-                lines.append(f"commands  {len(_commands)} pending")
-                lines.append(f"gifs      {sorted(_gifs)}")
-                lines.append(f"sprites   { {k: len(v[0]) for k, v in _sprites.items()} }")
+                lines.append("devices:")
+                for did, (b, ts) in _deviceinfo.items():
+                    lines.append(f"  {did}  {now - ts:5.1f}s ago  cmds={len(_commands.get(did, []))}")
+                lines.append(f"sprites   {sorted(_sprites)}")
             return self._send(200, "aiclock-relay ok\n\n" + "\n".join(lines) + "\n")
 
-        # Mac reads device info (Bearer)
+        # ---- Mac control reads (Bearer) ----
+        if path == "/control/devices":
+            if not self._bearer_ok():
+                return self._send(403, "forbidden")
+            now = time.time()
+            out = []
+            with _lock:
+                for did, (b, ts) in list(_deviceinfo.items()):
+                    if now - ts > DEVICE_TTL:
+                        continue
+                    try:
+                        info = json.loads(b)
+                    except Exception:
+                        info = {}
+                    info["_id"] = did
+                    info["_age"] = int(now - ts)
+                    out.append(info)
+            return self._send(200, json.dumps(out).encode(), JSON)
+
         if path == "/control/deviceinfo":
             if not self._bearer_ok():
                 return self._send(403, "forbidden")
             with _lock:
-                di = _deviceinfo
+                di = _deviceinfo.get(self._qs_id())
             if di is None:
                 return self._send(404, "no device info yet")
             body, ts = di
             return self._send(200, body, JSON, {"X-Relay-Age": str(int(time.time() - ts))})
 
-        # Mac reads the clock's current sprite raw for the mirror (Bearer)
         if path.startswith("/control/sprite/"):
             if not self._bearer_ok():
                 return self._send(403, "forbidden")
+            slot = path[len("/control/sprite/"):]
             with _lock:
-                sp = _sprites.get(path[len("/control/sprite/"):])
+                sp = _sprites.get(f"{self._qs_id()}/{slot}")
             if sp is None:
                 return self._send(404, "no sprite yet")
             return self._send(200, sp[0], BIN)
 
-        # Clock pulls (capability path /r/<secret>/...)
+        # ---- Clock pulls (capability path /r/<secret>/...) ----
         if path.startswith("/r/"):
             secret, _, sub = path[len("/r/"):].partition("/")
             if not eq(secret, PULL_SECRET):
                 return self._send(403, "forbidden")
             key = PULL_MAP.get(sub)
-            if key is not None:                      # telemetry
+            if key is not None:                      # telemetry (shared)
                 with _lock:
                     entry = _store.get(key)
                 if entry is None:
                     return self._send(404, "no data yet")
                 return self._send(200, entry[0], KEYS[key])
-            if sub == "commands":                    # drain pending commands
+            if sub == "commands":                    # drain this device's commands
+                did = self._qs_id()
                 with _lock:
-                    cmds = _commands[:]
-                    _commands.clear()
+                    cmds = _commands.pop(did, [])
                 return self._send(200, json.dumps(cmds).encode(), JSON)
-            if sub.startswith("gif/"):               # fetch a pending gif blob
+            if sub.startswith("gif/"):               # fetch this device's gif blob
+                slot = sub[len("gif/"):]
                 with _lock:
-                    blob = _gifs.get(sub[len("gif/"):])
+                    blob = _gifs.get(f"{self._qs_id()}/{slot}")
                 if blob is None:
                     return self._send(404, "no gif")
                 return self._send(200, blob, BIN)
@@ -158,10 +183,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST ----
     def do_POST(self):
-        global _deviceinfo
         path = self.path.split("?", 1)[0]
 
-        # Mac telemetry push (Bearer)
+        # Mac telemetry push (Bearer, shared)
         if path.startswith("/ingest/"):
             if not self._bearer_ok():
                 return self._send(403, "forbidden")
@@ -173,10 +197,13 @@ class Handler(BaseHTTPRequestHandler):
                 _store[key] = (body, time.time())
             return self._send(200, "ok")
 
-        # Mac enqueues a control command (Bearer)
+        # Mac enqueues a control command for a device (Bearer)
         if path == "/control/command":
             if not self._bearer_ok():
                 return self._send(403, "forbidden")
+            did = self._qs_id()
+            if not did:
+                return self._send(400, "id required")
             try:
                 cmd = json.loads(self._read_body())
             except Exception:
@@ -184,35 +211,44 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(cmd, dict) or "type" not in cmd:
                 return self._send(400, "command needs a type")
             with _lock:
-                _commands.append(cmd)
-                del _commands[:-MAX_COMMANDS]  # keep only the newest MAX_COMMANDS
+                q = _commands.setdefault(did, [])
+                q.append(cmd)
+                del q[:-MAX_COMMANDS]
             return self._send(200, "ok")
 
-        # Mac uploads a gif blob for a slot (Bearer)
+        # Mac uploads a gif blob for a device+slot (Bearer)
         if path.startswith("/control/gif/"):
             if not self._bearer_ok():
                 return self._send(403, "forbidden")
             slot = path[len("/control/gif/"):]
+            did = self._qs_id()
+            if not did:
+                return self._send(400, "id required")
             body = self._read_body()
             with _lock:
-                _gifs[slot] = body
+                _gifs[f"{did}/{slot}"] = body
             return self._send(200, "ok")
 
-        # Clock reports its /api/info (capability path)
+        # Clock-side POSTs (capability path)
         if path.startswith("/r/"):
             secret, _, sub = path[len("/r/"):].partition("/")
             if not eq(secret, PULL_SECRET):
                 return self._send(403, "forbidden")
-            if sub == "deviceinfo":
+            if sub == "deviceinfo":                  # clock reports its /api/info
                 body = self._read_body()
+                try:
+                    obj = json.loads(body)
+                    did = str(obj.get("id") or obj.get("ip") or "unknown")
+                except Exception:
+                    did = "unknown"
                 with _lock:
-                    _deviceinfo = (body, time.time())
+                    _deviceinfo[did] = (body, time.time())
                 return self._send(200, "ok")
             if sub.startswith("sprite/"):            # clock uploads its sprite raw
                 slot = sub[len("sprite/"):]
                 body = self._read_body()
                 with _lock:
-                    _sprites[slot] = (body, time.time())
+                    _sprites[f"{self._qs_id()}/{slot}"] = (body, time.time())
                 return self._send(200, "ok")
             return self._send(404, "no such route")
 
@@ -222,7 +258,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
-    print(f"[relay] listening on 0.0.0.0:{PORT}  telemetry + control channel", flush=True)
+    print(f"[relay] listening on 0.0.0.0:{PORT}  telemetry(shared) + per-device control", flush=True)
     srv.serve_forever()
 
 
