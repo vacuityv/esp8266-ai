@@ -149,7 +149,7 @@ final class DeviceClient {
         let url: URL
         var bearer: String? = nil
         if let relay = relayControl {
-            url = relay.base.appendingPathComponent("control/sprite/\(slot)")
+            url = relayURL(relay.base, "control/sprite/\(slot)")
             bearer = relay.token
         } else if let base = baseURL {
             url = base.appendingPathComponent("sprite/\(slot)/raw")
@@ -190,9 +190,47 @@ final class DeviceClient {
     /// Device stale after this long without reporting to the relay => "offline".
     private static let relayInfoStaleSeconds = 30
 
+    /// Which device the relay control ops target (its chip id). Persisted so the
+    /// user's pick sticks. Multiple clocks share telemetry but are controlled
+    /// individually by id.
+    static var selectedDeviceId: String {
+        get { UserDefaults.standard.string(forKey: "selected_device_id") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "selected_device_id") }
+    }
+
+    private static func relayURL(_ base: URL, _ path: String) -> URL {
+        let id = selectedDeviceId.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        return URL(string: base.appendingPathComponent(path).absoluteString + "?id=\(id)")
+            ?? base.appendingPathComponent(path)
+    }
+
+    struct DeviceSummary { var id: String; var name: String; var ip: String; var mode: String; var age: Int }
+
+    /// Lists every clock that has reported to the relay (for the device picker).
+    static func fetchDevices(completion: @escaping ([DeviceSummary]) -> Void) {
+        guard let relay = relayControl else { completion([]); return }
+        var req = URLRequest(url: relay.base.appendingPathComponent("control/devices"))
+        req.timeoutInterval = 8
+        req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            var list: [DeviceSummary] = []
+            if let data = data,
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                list = arr.map {
+                    DeviceSummary(id: $0["_id"] as? String ?? $0["id"] as? String ?? "",
+                                  name: $0["name"] as? String ?? "",
+                                  ip: $0["ip"] as? String ?? "",
+                                  mode: $0["mode"] as? String ?? "",
+                                  age: ($0["_age"] as? NSNumber)?.intValue ?? 999)
+                }
+            }
+            DispatchQueue.main.async { completion(list) }
+        }.resume()
+    }
+
     private static func fetchInfoViaRelay(_ relay: (base: URL, token: String),
                                           completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
-        var req = URLRequest(url: relay.base.appendingPathComponent("control/deviceinfo"))
+        var req = URLRequest(url: relayURL(relay.base, "control/deviceinfo"))
         req.timeoutInterval = 8
         req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
         URLSession.shared.dataTask(with: req) { data, resp, error in
@@ -222,7 +260,7 @@ final class DeviceClient {
     /// next poll and applies it locally.
     private static func sendCommand(_ relay: (base: URL, token: String), _ cmd: [String: Any],
                                     completion: @escaping (Error?) -> Void) {
-        var req = URLRequest(url: relay.base.appendingPathComponent("control/command"))
+        var req = URLRequest(url: relayURL(relay.base, "control/command"))
         req.httpMethod = "POST"
         req.timeoutInterval = 8
         req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")
@@ -235,7 +273,7 @@ final class DeviceClient {
     /// the device to fetch and decode it for the given slot.
     private static func uploadGifViaRelay(_ relay: (base: URL, token: String), _ gif: Data,
                                           slot: String, completion: @escaping (Error?) -> Void) {
-        var req = URLRequest(url: relay.base.appendingPathComponent("control/gif/\(slot)"))
+        var req = URLRequest(url: relayURL(relay.base, "control/gif/\(slot)"))
         req.httpMethod = "POST"
         req.timeoutInterval = 30
         req.setValue("Bearer \(relay.token)", forHTTPHeaderField: "Authorization")

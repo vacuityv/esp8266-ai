@@ -398,6 +398,9 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
+    private let deviceControl = NSSegmentedControl(labels: [], trackingMode: .selectOne,
+                                                   target: nil, action: nil)
+    private var devices: [DeviceClient.DeviceSummary] = []
 
     private var pollTimer: Timer?
     private var animTimer: Timer?
@@ -430,17 +433,22 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
         modeControl.target = self
         modeControl.action = #selector(modeChanged)
+        deviceControl.target = self
+        deviceControl.action = #selector(deviceChanged)
+        deviceControl.isHidden = true // shown only when >1 device
         statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.alignment = .center
         statusLabel.lineBreakMode = .byTruncatingMiddle
 
-        for v in [mirror, modeControl, statusLabel] {
+        for v in [deviceControl, mirror, modeControl, statusLabel] {
             v.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(v)
         }
         NSLayoutConstraint.activate([
-            mirror.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+            deviceControl.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            deviceControl.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            mirror.topAnchor.constraint(equalTo: deviceControl.bottomAnchor, constant: 8),
             mirror.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             mirror.widthAnchor.constraint(equalToConstant: 288),
             mirror.heightAnchor.constraint(equalToConstant: 288),
@@ -461,6 +469,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             usage.refresh() // pull fresh quota so the bars aren't up to 120s stale
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             startTimers()
+            refreshDeviceList()
             tick()
         }
     }
@@ -681,5 +690,40 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         pendingMode = mode
         pendingModeSince = Date()
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
+    }
+
+    // MARK: - device picker (tabs)
+
+    /// Fetches the list of clocks and rebuilds the device tabs. Hidden when there
+    /// is only one device (nothing to pick).
+    private func refreshDeviceList() {
+        DeviceClient.fetchDevices { [weak self] list in
+            guard let self = self, self.popover.isShown else { return }
+            self.devices = list
+            // Keep a valid selection: default to the first device if none / stale.
+            if DeviceClient.selectedDeviceId.isEmpty
+                || !list.contains(where: { $0.id == DeviceClient.selectedDeviceId }) {
+                DeviceClient.selectedDeviceId = list.first?.id ?? ""
+                self.tick() // selection changed -> refresh the mirror
+            }
+            self.deviceControl.segmentCount = list.count
+            for (i, d) in list.enumerated() {
+                let title = !d.name.isEmpty ? d.name : (!d.ip.isEmpty ? d.ip : d.id)
+                self.deviceControl.setLabel(title, forSegment: i)
+                self.deviceControl.setWidth(0, forSegment: i) // auto-size to label
+            }
+            if let idx = list.firstIndex(where: { $0.id == DeviceClient.selectedDeviceId }) {
+                self.deviceControl.selectedSegment = idx
+            }
+            self.deviceControl.isHidden = list.count < 2
+        }
+    }
+
+    @objc private func deviceChanged() {
+        let idx = deviceControl.selectedSegment
+        guard idx >= 0, idx < devices.count else { return }
+        DeviceClient.selectedDeviceId = devices[idx].id
+        pendingMode = nil // switching device: don't carry over the old device's pending pick
+        tick()
     }
 }
