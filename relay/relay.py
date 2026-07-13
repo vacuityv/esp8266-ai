@@ -47,7 +47,7 @@ PUSH_MAP = {"status": "status", "net": "net", "music": "music",
             "cover.raw": "cover", "text.raw": "text"}
 
 MAX_COMMANDS = 50   # per-device queue cap
-DEVICE_TTL = 600    # drop a device from the list after this many seconds silent
+DEVICE_TTL = 90     # drop a device from the list after this many seconds silent
 
 _lock = threading.Lock()
 _store = {}          # telemetry key -> (bytes, ts)   [SHARED across devices]
