@@ -410,17 +410,42 @@ uint16_t lerp565(uint16_t a, uint16_t b, float t) {
 
 // One progress bar: dark track, purple->green gradient fill of length `fillPct`,
 // plus an optional time marker (light core, dark edges) at `timePct`.
+// Vertical inset that keeps column `i` inside the bar's rounded end caps, so
+// nothing we paint ever bleeds past the curve.
+int capInset(int i, int w, int r) {
+  int dx = -1;
+  if (i < r) dx = r - 1 - i;
+  else if (i >= w - r) dx = i - (w - r);
+  if (dx < 0) return 0;
+  return r - (int)(sqrtf((float)(r * r - dx * dx)) + 0.5f);
+}
+
 void drawQuotaBar(int x, int y, int w, int h, float fillPct, float timePct, bool hasTime) {
-  tft.fillRoundRect(x, y, w, h, h / 2, tft.color565(48, 48, 48));
+  int r = h / 2;
+  // fillRoundRect never repaints the four corner nubs, and this panel is
+  // deliberately never cleared to black (that would flicker). So anything that
+  // once bled past the curve — e.g. the fill back when usage was ~100% — would
+  // stay stuck there forever. Scrub the nubs before redrawing.
+  tft.fillRect(x, y, r, r, TFT_BLACK);
+  tft.fillRect(x + w - r, y, r, r, TFT_BLACK);
+  tft.fillRect(x, y + h - r, r, r, TFT_BLACK);
+  tft.fillRect(x + w - r, y + h - r, r, r, TFT_BLACK);
+
+  tft.fillRoundRect(x, y, w, h, r, tft.color565(48, 48, 48));
   uint16_t pur = tft.color565(125, 92, 252), grn = tft.color565(61, 214, 140);
   int fillW = (int)(w * constrain(fillPct, 0.0f, 100.0f) / 100.0f);
   for (int i = 0; i < fillW; i++) {
-    tft.drawFastVLine(x + i, y, h, lerp565(pur, grn, (float)i / w));
+    int in = capInset(i, w, r);
+    tft.drawFastVLine(x + i, y + in, h - 2 * in, lerp565(pur, grn, (float)i / w));
   }
   if (hasTime) {
     int ax = x + (int)(w * constrain(timePct, 0.0f, 100.0f) / 100.0f);
-    tft.fillRect(ax - 2, y, 4, h, tft.color565(8, 8, 8)); // dark edge
-    tft.fillRect(ax - 1, y, 2, h, TFT_WHITE);             // light core
+    ax = constrain(ax, x + 2, x + w - 2);
+    for (int d = -2; d <= 1; d++) { // 4px dark edge with a 2px light core
+      int in = capInset(ax + d - x, w, r);
+      tft.drawFastVLine(ax + d, y + in, h - 2 * in,
+                        (d == -1 || d == 0) ? TFT_WHITE : tft.color565(8, 8, 8));
+    }
   }
 }
 
