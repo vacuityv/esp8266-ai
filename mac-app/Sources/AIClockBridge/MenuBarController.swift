@@ -37,11 +37,16 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     /// User-supplied device logo (bezel + dark screen + smiley + green status
     /// dot). Full-color, so NOT a template image — it keeps its colors in
     /// both light and dark menu bars.
+    /// 15pt, not the usual 18: this glyph is a solid filled square, so at the
+    /// same nominal size it reads much heavier than the thin line icons it sits
+    /// next to in the menu bar.
+    private static let iconSize: CGFloat = 15
+
     private static func retroMacIcon() -> NSImage {
         guard let img = AppResources.image("happy-mac") else {
-            return NSImage(size: NSSize(width: 18, height: 18))
+            return NSImage(size: NSSize(width: iconSize, height: iconSize))
         }
-        img.size = NSSize(width: 18, height: 18)
+        img.size = NSSize(width: iconSize, height: iconSize)
         img.isTemplate = false
         return img
     }

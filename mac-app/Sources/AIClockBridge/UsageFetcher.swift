@@ -69,8 +69,18 @@ final class UsageFetcher {
         }
     }
 
+    /// How long a last-known-good reading may stand in for a failed refresh.
+    private static let maxStaleAge: TimeInterval = 30 * 60
+
     private static func merge(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
         if new.primaryPct == nil && new.weeklyPct == nil && old.primaryPct != nil {
+            // Stale beats nothing, but only for a while. Keeping the last good
+            // numbers indefinitely is what let the clock show 6% for hours while
+            // the real figure had climbed to 41%: wrong data that looks live is
+            // worse than no data.
+            if let at = old.fetchedAt, Date().timeIntervalSince(at) > maxStaleAge {
+                return new
+            }
             var kept = old
             kept.error = new.error
             return kept
@@ -136,8 +146,15 @@ final class UsageFetcher {
             p.standardOutput = pipe
             p.standardError = Pipe()
             guard (try? p.run()) != nil else { return nil }
+            // If the Keychain ever puts up an access prompt (the CLI rewrites
+            // this item on token refresh, which can drop our ACL entry), a
+            // background agent can never answer it and would block here
+            // forever, freezing all later refreshes. Cap the wait instead.
+            let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10, execute: killer)
             let out = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
+            killer.cancel()
             guard p.terminationStatus == 0 else { return nil }
             raw = Data(String(decoding: out, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines).utf8)
@@ -243,13 +260,20 @@ final class UsageFetcher {
     private static func syncRequest(_ req: URLRequest) -> (Data, Int)? {
         let sem = DispatchSemaphore(value: 0)
         var result: (Data, Int)?
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
+        let task = URLSession.shared.dataTask(with: req) { data, resp, _ in
             if let data = data, let http = resp as? HTTPURLResponse {
                 result = (data, http.statusCode)
             }
             sem.signal()
-        }.resume()
-        sem.wait()
+        }
+        task.resume()
+        // Never wait forever. A completion that never fires (sleep/wake races,
+        // a stalled connection) would strand `fetching` and silently freeze
+        // every later refresh until the app is restarted.
+        if sem.wait(timeout: .now() + req.timeoutInterval + 10) == .timedOut {
+            task.cancel()
+            return nil
+        }
         return result
     }
 }
