@@ -17,6 +17,7 @@ struct ProviderUsage {
     var error: String?
     var fetchedAt: Date?
     var rateLimited = false
+    var retryAfter: TimeInterval?  // server-dictated cooldown from a 429
 }
 
 final class UsageFetcher {
@@ -60,7 +61,11 @@ final class UsageFetcher {
             self._claude = Self.merge(old: self._claude, new: claude)
             self._codex = Self.merge(old: self._codex, new: codex)
             self.fetching = false
-            let backoff: TimeInterval = claude.rateLimited ? self.rateLimitBackoff : self.minFetchInterval
+            // Obey the server's own cooldown. Retrying every 5 min while it asks
+            // for ~1h just keeps the penalty alive, which is what left the clock
+            // with no Claude figures for hours.
+            let backoff: TimeInterval = claude.retryAfter
+                ?? (claude.rateLimited ? self.rateLimitBackoff : self.minFetchInterval)
             self.nextAllowedFetch = Date().addingTimeInterval(backoff)
             self.lock.unlock()
             if let e = claude.error { FileHandle.standardError.write(Data("[usage] claude: \(e)\n".utf8)) }
@@ -91,6 +96,12 @@ final class UsageFetcher {
     // MARK: - Claude (api.anthropic.com/api/oauth/usage)
 
     private func fetchClaude() -> ProviderUsage {
+        // Prefer CodexBar's snapshot when it's around: it polls the same
+        // endpoint but paces itself, whereas our own 2-minute cadence earned a
+        // 429 with an hour-long retry-after and left the clock blank. Reading
+        // its file costs no request and touches no credentials.
+        if let snapshot = Self.claudeFromCodexBar() { return snapshot }
+
         var usage = ProviderUsage()
         guard let token = Self.claudeAccessToken() else {
             usage.error = "未找到 Claude Code 登录凭据"
@@ -103,12 +114,13 @@ final class UsageFetcher {
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         req.setValue("claude-code/2.1.0", forHTTPHeaderField: "User-Agent")
 
-        guard let (data, code) = Self.syncRequest(req) else {
+        guard let (data, code, retryAfter) = Self.syncRequest(req) else {
             usage.error = "Claude 用量请求失败"
             return usage
         }
         guard code == 200 else {
             usage.rateLimited = code == 429
+            usage.retryAfter = code == 429 ? retryAfter : nil
             usage.error = code == 401 ? "Claude 凭据过期，运行 claude 重新登录"
                 : code == 429 ? "Claude 用量接口限流，稍后自动重试"
                 : "Claude 用量接口 HTTP \(code)"
@@ -183,7 +195,7 @@ final class UsageFetcher {
             req.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
 
-        guard let (data, code) = Self.syncRequest(req) else {
+        guard let (data, code, _) = Self.syncRequest(req) else {
             usage.error = "Codex 用量请求失败"
             return usage
         }
@@ -242,27 +254,63 @@ final class UsageFetcher {
         return nil
     }
 
+    // MARK: - Claude via CodexBar's widget snapshot
+
+    /// CodexBar writes this for its own widget, so it is a stable, structured
+    /// hand-off rather than something we reverse-engineered. Only used while
+    /// fresh; otherwise we fall back to asking the API ourselves.
+    private static let codexBarSnapshotPath =
+        ("~/Library/Group Containers/Y5PE65HELJ.com.steipete.codexbar/widget-snapshot.json"
+            as NSString).expandingTildeInPath
+    private static let snapshotMaxAge: TimeInterval = 20 * 60
+
+    private static func claudeFromCodexBar() -> ProviderUsage? {
+        guard let data = FileManager.default.contents(atPath: codexBarSnapshotPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = obj["entries"] as? [[String: Any]],
+              let entry = entries.first(where: { $0["provider"] as? String == "claude" }),
+              let updated = parseISO(entry["updatedAt"] as? String),
+              Date().timeIntervalSince(updated) < snapshotMaxAge
+        else { return nil }
+
+        var usage = ProviderUsage()
+        let now = Date().timeIntervalSince1970
+        if let p = entry["primary"] as? [String: Any] {
+            usage.primaryPct = (p["usedPercent"] as? NSNumber)?.doubleValue
+            usage.primaryResetMin = minutesUntil(iso: p["resetsAt"] as? String, now: now)
+        }
+        if let s = entry["secondary"] as? [String: Any] {
+            usage.weeklyPct = (s["usedPercent"] as? NSNumber)?.doubleValue
+            usage.weeklyResetMin = minutesUntil(iso: s["resetsAt"] as? String, now: now)
+        }
+        guard usage.primaryPct != nil || usage.weeklyPct != nil else { return nil }
+        usage.fetchedAt = updated
+        return usage
+    }
+
     // MARK: - helpers
 
-    private static func minutesUntil(iso: String?, now: Double) -> Int? {
+    private static func parseISO(_ iso: String?) -> Date? {
         guard let iso = iso else { return nil }
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var date = f.date(from: iso)
-        if date == nil {
-            f.formatOptions = [.withInternetDateTime]
-            date = f.date(from: iso)
-        }
-        guard let d = date else { return nil }
+        if let d = f.date(from: iso) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: iso)
+    }
+
+    private static func minutesUntil(iso: String?, now: Double) -> Int? {
+        guard let d = parseISO(iso) else { return nil }
         return max(0, Int((d.timeIntervalSince1970 - now) / 60))
     }
 
-    private static func syncRequest(_ req: URLRequest) -> (Data, Int)? {
+    private static func syncRequest(_ req: URLRequest) -> (Data, Int, TimeInterval?)? {
         let sem = DispatchSemaphore(value: 0)
-        var result: (Data, Int)?
+        var result: (Data, Int, TimeInterval?)?
         let task = URLSession.shared.dataTask(with: req) { data, resp, _ in
             if let data = data, let http = resp as? HTTPURLResponse {
-                result = (data, http.statusCode)
+                let retry = (http.value(forHTTPHeaderField: "retry-after")).flatMap(TimeInterval.init)
+                result = (data, http.statusCode, retry)
             }
             sem.signal()
         }
