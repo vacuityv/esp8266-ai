@@ -26,7 +26,16 @@ final class UsageFetcher {
     private var _codex = ProviderUsage()
     private var timer: Timer?
     private var fetching = false
-    private var nextAllowedFetch = Date.distantPast // throttle + 429 backoff
+    private var nextAllowedFetch = Date.distantPast // ordinary in-memory throttle
+
+    /// A 429 cooldown outlives the process, so it is persisted: a restart used to
+    /// wipe it and start knocking again, which is what kept the penalty alive.
+    /// Gates only the network call — reading CodexBar's snapshot stays free.
+    private static let blockedUntilKey = "claudeUsageBlockedUntil"
+    private var claudeBlockedUntil: Date {
+        get { Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: Self.blockedUntilKey)) }
+        set { UserDefaults.standard.set(newValue.timeIntervalSince1970, forKey: Self.blockedUntilKey) }
+    }
 
     private let minFetchInterval: TimeInterval = 60
     private let rateLimitBackoff: TimeInterval = 300
@@ -64,9 +73,11 @@ final class UsageFetcher {
             // Obey the server's own cooldown. Retrying every 5 min while it asks
             // for ~1h just keeps the penalty alive, which is what left the clock
             // with no Claude figures for hours.
-            let backoff: TimeInterval = claude.retryAfter
-                ?? (claude.rateLimited ? self.rateLimitBackoff : self.minFetchInterval)
-            self.nextAllowedFetch = Date().addingTimeInterval(backoff)
+            self.nextAllowedFetch = Date().addingTimeInterval(self.minFetchInterval)
+            if claude.rateLimited {
+                self.claudeBlockedUntil = Date().addingTimeInterval(
+                    claude.retryAfter ?? self.rateLimitBackoff)
+            }
             self.lock.unlock()
             if let e = claude.error { FileHandle.standardError.write(Data("[usage] claude: \(e)\n".utf8)) }
             if let e = codex.error { FileHandle.standardError.write(Data("[usage] codex: \(e)\n".utf8)) }
@@ -103,6 +114,13 @@ final class UsageFetcher {
         if let snapshot = Self.claudeFromCodexBar() { return snapshot }
 
         var usage = ProviderUsage()
+        // No usable snapshot, so ask the API ourselves - but not while the server
+        // still wants us quiet. Deliberately not flagged as rateLimited: this is
+        // us honouring an existing cooldown, not earning a fresh one.
+        guard Date() >= claudeBlockedUntil else {
+            usage.error = "Claude 用量接口限流中，等待冷却"
+            return usage
+        }
         guard let token = Self.claudeAccessToken() else {
             usage.error = "未找到 Claude Code 登录凭据"
             return usage
